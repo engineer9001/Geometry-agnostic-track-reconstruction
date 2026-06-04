@@ -99,11 +99,18 @@ class MaskedTransformerEncoder(nn.Module):
         """
         # Out-of-place feature scaling to bring raw physics scales into O(1) bounds
         if self.input_dim == 2:
-            t_diff_scaled = x[..., 0:1] / 100.0
-            edep_scaled = x[..., 1:2] * 1000.0
+            # Updated based on raw physical bounds
+            t_diff_scaled = x[..., 0:1] / 40.0
+            edep_scaled = x[..., 1:2] / 0.006
             x_scaled = torch.cat([t_diff_scaled, edep_scaled], dim=-1)
         else:
-            x_scaled = x
+            x_scaled = x.clone()
+
+        # CRITICAL FIX: Ensure padded sequences remain strictly zero after scaling
+        if src_key_padding_mask is not None:
+            # Expand mask to match feature dimension: (batch, seq_len, 1)
+            mask_expanded = src_key_padding_mask.unsqueeze(-1)
+            x_scaled = x_scaled.masked_fill(mask_expanded, 0.0)
 
         x_projected = self.input_projection(x_scaled)
         x_encoded = self.pos_encoding(x_projected, channel_indices=channel_indices)
@@ -140,7 +147,7 @@ class MomentumPredictionHead(nn.Module):
             nn.Linear(dim_feedforward, dim_feedforward // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim_feedforward // 2, 3),  # Updated output dim from 1 to 3 for Px, Py, Pz
+            nn.Linear(dim_feedforward // 2, 3),  # Output dim 3 for Px, Py, Pz
         )
 
     def forward(
@@ -261,31 +268,3 @@ class DenoisingTrackModel(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor,
         channel_indices: Optional[torch.Tensor] = None,
-        add_noise: bool = True,
-    ) -> torch.Tensor:
-        x_noisy = self.add_noise(x, mask) if add_noise else x
-        return self.model(x_noisy, mask=mask, channel_indices=channel_indices)
-
-
-def momentum_loss(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """
-    Computes MSE loss between predicted and true 3D momentum vectors (Px, Py, Pz).
-    Expects both tensors to be shape (batch_size, 3).
-    """
-    return F.mse_loss(output, target)
-
-
-def masked_mse_loss(output: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Computes MSE loss only on the valid (unmasked) elements."""
-    loss = F.mse_loss(output, target, reduction='none')
-    loss[mask] = 0.0
-    active_elements = (~mask).sum().clamp(min=1) * loss.shape[-1]
-    return loss.sum() / active_elements
-
-
-def masked_l1_loss(output: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Computes L1 loss only on the valid (unmasked) elements."""
-    loss = F.l1_loss(output, target, reduction='none')
-    loss[mask] = 0.0
-    active_elements = (~mask).sum().clamp(min=1) * loss.shape[-1]
-    return loss.sum() / active_elements
