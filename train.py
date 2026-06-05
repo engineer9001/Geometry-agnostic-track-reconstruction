@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Tuple, Dict, Any, List
@@ -8,6 +9,7 @@ from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR
@@ -91,6 +93,21 @@ def sparse_collate_fn(batch: List[Tuple]) -> Tuple:
     return x_padded, mask_padded, indices_padded
 
 
+# Thread-local storage for per-worker HDF5 file handles.
+# Each DataLoader worker gets its own open handle, eliminating the
+# open/close overhead that would otherwise occur on every __getitem__ call.
+_tls = threading.local()
+
+
+def _get_h5_handle(path: str) -> "h5py.File":
+    """Return a cached, per-thread HDF5 file handle for *path*."""
+    if not hasattr(_tls, "handles"):
+        _tls.handles = {}
+    if path not in _tls.handles:
+        _tls.handles[path] = h5py.File(path, "r", swmr=True)
+    return _tls.handles[path]
+
+
 class MultiFileHDF5Dataset(Dataset):
     """PyTorch Dataset that loads sparse tracks from multiple HDF5 files."""
 
@@ -105,9 +122,9 @@ class MultiFileHDF5Dataset(Dataset):
         p = Path(data_path)
         
         if p.is_dir():
-            self.h5_files = sorted(p.glob("*.h5"))
+            self.h5_files = [str(x) for x in sorted(p.glob("*.h5"))]
         elif p.is_file():
-            self.h5_files = [p]
+            self.h5_files = [str(p)]
         else:
             raise FileNotFoundError(f"Path does not exist: {data_path}")
 
@@ -134,10 +151,10 @@ class MultiFileHDF5Dataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         file_idx, track_name = self.track_index[idx]
-        with h5py.File(self.h5_files[file_idx], "r") as f:
-            return build_sparse_track_from_hdf5_group(
-                f["tracks"][track_name], self.channel_index, self.feature_names
-            )
+        f = _get_h5_handle(self.h5_files[file_idx])
+        return build_sparse_track_from_hdf5_group(
+            f["tracks"][track_name], self.channel_index, self.feature_names
+        )
 
 
 class TrackHDF5Dataset(Dataset):
@@ -150,11 +167,11 @@ class TrackHDF5Dataset(Dataset):
         feature_names: Tuple[str, ...] = ("t_diff", "edep"),
         max_tracks: Optional[int] = None,
     ):
-        self.h5_path = h5_path
+        self.h5_path = str(h5_path)
         self.channel_index = channel_index
         self.feature_names = feature_names
 
-        with h5py.File(h5_path, "r") as f:
+        with h5py.File(self.h5_path, "r") as f:
             self.track_names = list(f["tracks"].keys())
             if max_tracks:
                 self.track_names = self.track_names[:max_tracks]
@@ -163,10 +180,10 @@ class TrackHDF5Dataset(Dataset):
         return len(self.track_names)
 
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        with h5py.File(self.h5_path, "r") as f:
-            return build_sparse_track_from_hdf5_group(
-                f["tracks"][self.track_names[idx]], self.channel_index, self.feature_names
-            )
+        f = _get_h5_handle(self.h5_path)
+        return build_sparse_track_from_hdf5_group(
+            f["tracks"][self.track_names[idx]], self.channel_index, self.feature_names
+        )
 
 
 class MomentumTrackDataset(Dataset):
@@ -179,11 +196,11 @@ class MomentumTrackDataset(Dataset):
         feature_names: Tuple[str, ...] = ("t_diff", "edep"),
         max_tracks: Optional[int] = None,
     ):
-        self.h5_path = h5_path
+        self.h5_path = str(h5_path)
         self.channel_index = channel_index
         self.feature_names = feature_names
 
-        with h5py.File(h5_path, "r") as f:
+        with h5py.File(self.h5_path, "r") as f:
             self.track_names = list(f["tracks"].keys())
             if max_tracks:
                 self.track_names = self.track_names[:max_tracks]
@@ -192,16 +209,14 @@ class MomentumTrackDataset(Dataset):
         return len(self.track_names)
 
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
-        with h5py.File(self.h5_path, "r") as f:
-            track_group = f["tracks"][self.track_names[idx]]
-            features, indices = build_sparse_track_from_hdf5_group(
-                track_group, self.channel_index, self.feature_names
-            )
-            # Unpack individual vector components from group attributes
-            px = track_group.attrs.get("true_mom_x", 0.0)
-            py = track_group.attrs.get("true_mom_y", 0.0)
-            pz = track_group.attrs.get("true_mom_z", 0.0)
-            
+        f = _get_h5_handle(self.h5_path)
+        track_group = f["tracks"][self.track_names[idx]]
+        features, indices = build_sparse_track_from_hdf5_group(
+            track_group, self.channel_index, self.feature_names
+        )
+        px = float(track_group.attrs.get("true_mom_x", 0.0))
+        py = float(track_group.attrs.get("true_mom_y", 0.0))
+        pz = float(track_group.attrs.get("true_mom_z", 0.0))
         return features, indices, torch.tensor([px, py, pz], dtype=torch.float32)
 
 
@@ -217,9 +232,9 @@ class MultiFileMomentumDataset(Dataset):
     ):
         p = Path(data_path)
         if p.is_dir():
-            self.h5_files = sorted(p.glob("*.h5"))
+            self.h5_files = [str(x) for x in sorted(p.glob("*.h5"))]
         else:
-            self.h5_files = [p]
+            self.h5_files = [str(p)]
 
         self.channel_index = channel_index
         self.feature_names = feature_names
@@ -244,16 +259,14 @@ class MultiFileMomentumDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
         file_idx, track_name = self.track_index[idx]
-        with h5py.File(self.h5_files[file_idx], "r") as f:
-            track_group = f["tracks"][track_name]
-            features, indices = build_sparse_track_from_hdf5_group(
-                track_group, self.channel_index, self.feature_names
-            )
-            # Unpack individual vector components from group attributes
-            px = track_group.attrs.get("true_mom_x", 0.0)
-            py = track_group.attrs.get("true_mom_y", 0.0)
-            pz = track_group.attrs.get("true_mom_z", 0.0)
-            
+        f = _get_h5_handle(self.h5_files[file_idx])
+        track_group = f["tracks"][track_name]
+        features, indices = build_sparse_track_from_hdf5_group(
+            track_group, self.channel_index, self.feature_names
+        )
+        px = float(track_group.attrs.get("true_mom_x", 0.0))
+        py = float(track_group.attrs.get("true_mom_y", 0.0))
+        pz = float(track_group.attrs.get("true_mom_z", 0.0))
         return features, indices, torch.tensor([px, py, pz], dtype=torch.float32)
 
 
@@ -280,11 +293,17 @@ def create_dataloaders(
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=torch.cuda.is_available(), collate_fn=sparse_collate_fn,
+        num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+        collate_fn=sparse_collate_fn,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=(2 if num_workers > 0 else None),
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=torch.cuda.is_available(), collate_fn=sparse_collate_fn,
+        num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+        collate_fn=sparse_collate_fn,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=(2 if num_workers > 0 else None),
     )
     return train_loader, val_loader
 
@@ -294,35 +313,47 @@ def train_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scaler: GradScaler,
     loss_fn: callable = masked_mse_loss,
     accumulation_steps: int = 1,
     task: str = "reconstruction",
 ) -> float:
-    """Train for one epoch."""
+    """Train for one epoch with AMP (automatic mixed precision)."""
     model.train()
     total_loss = 0.0
     num_batches = 0
+    use_amp = device.type == "cuda"
 
     pbar = tqdm(dataloader, desc="Training")
     for batch_idx, batch_data in enumerate(pbar):
         if task == "momentum":
             x, mask, channel_indices, target = batch_data
-            x, mask, channel_indices, target = x.to(device), mask.to(device), channel_indices.to(device), target.to(device)
-            output = model(x, mask=mask, channel_indices=channel_indices)
-            # Removed target.unsqueeze(1) to map perfectly with shape (batch_size, 3)
-            loss = loss_fn(output, target)
+            x, mask, channel_indices, target = (
+                x.to(device, non_blocking=True),
+                mask.to(device, non_blocking=True),
+                channel_indices.to(device, non_blocking=True),
+                target.to(device, non_blocking=True),
+            )
+            with autocast(enabled=use_amp):
+                output = model(x, mask=mask, channel_indices=channel_indices)
+                loss = loss_fn(output, target) / accumulation_steps
         else:
             x, mask, channel_indices = batch_data
-            x, mask, channel_indices = x.to(device), mask.to(device), channel_indices.to(device)
-            output = model(x, mask=mask, channel_indices=channel_indices)
-            loss = loss_fn(output, x, mask)
+            x, mask, channel_indices = (
+                x.to(device, non_blocking=True),
+                mask.to(device, non_blocking=True),
+                channel_indices.to(device, non_blocking=True),
+            )
+            with autocast(enabled=use_amp):
+                output = model(x, mask=mask, channel_indices=channel_indices)
+                loss = loss_fn(output, x, mask) / accumulation_steps
 
-        loss = loss / accumulation_steps
-        loss.backward()
+        scaler.scale(loss).backward()
 
         if (batch_idx + 1) % accumulation_steps == 0:
-            optimizer.step()
-            optimizer.zero_grad()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         total_loss += loss.item() * accumulation_steps
         num_batches += 1
@@ -342,21 +373,32 @@ def validate(
     model.eval()
     total_loss = 0.0
     num_batches = 0
+    use_amp = device.type == "cuda"
 
     with torch.no_grad():
         pbar = tqdm(dataloader, desc="Validation")
         for batch_data in pbar:
             if task == "momentum":
                 x, mask, channel_indices, target = batch_data
-                x, mask, channel_indices, target = x.to(device), mask.to(device), channel_indices.to(device), target.to(device)
-                output = model(x, mask=mask, channel_indices=channel_indices)
-                # Removed target.unsqueeze(1) to map perfectly with shape (batch_size, 3)
-                loss = loss_fn(output, target)
+                x, mask, channel_indices, target = (
+                    x.to(device, non_blocking=True),
+                    mask.to(device, non_blocking=True),
+                    channel_indices.to(device, non_blocking=True),
+                    target.to(device, non_blocking=True),
+                )
+                with autocast(enabled=use_amp):
+                    output = model(x, mask=mask, channel_indices=channel_indices)
+                    loss = loss_fn(output, target)
             else:
                 x, mask, channel_indices = batch_data
-                x, mask, channel_indices = x.to(device), mask.to(device), channel_indices.to(device)
-                output = model(x, mask=mask, channel_indices=channel_indices)
-                loss = loss_fn(output, x, mask)
+                x, mask, channel_indices = (
+                    x.to(device, non_blocking=True),
+                    mask.to(device, non_blocking=True),
+                    channel_indices.to(device, non_blocking=True),
+                )
+                with autocast(enabled=use_amp):
+                    output = model(x, mask=mask, channel_indices=channel_indices)
+                    loss = loss_fn(output, x, mask)
 
             total_loss += loss.item()
             num_batches += 1
@@ -429,29 +471,49 @@ def main() -> None:
     else:
         model = TrackReconstructionModel(**config.to_dict())
 
-    model.to(device)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # cuDNN auto-tuner: finds the fastest conv algorithm for fixed input sizes.
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
+    model.to(device)
+
+    # torch.compile fuses ops and eliminates Python overhead in the forward pass.
+    # Falls back gracefully if the PyTorch version doesn't support it.
+    if hasattr(torch, "compile"):
+        logger.info("Applying torch.compile() to model...")
+        model = torch.compile(model)
+
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = GradScaler(enabled=(device.type == "cuda"))
+
+    # Warmup scheduler steps per-batch; cosine scheduler steps per-epoch.
     warmup_steps = args.warmup_epochs * len(train_loader)
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
-    cosine_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=len(train_loader), T_mult=1, eta_min=1e-6)
+    cosine_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=max(1, args.epochs - args.warmup_epochs), T_mult=1, eta_min=1e-6)
 
     best_val_loss = float("inf")
     patience, patience_counter = 15, 0
     history = {"train_loss": [], "val_loss": []}
 
+    loss_fn = momentum_loss if args.model_type == "momentum" else (masked_mse_loss if args.loss_fn == "mse" else masked_l1_loss)
+
     logger.info("Starting training...")
     for epoch in range(args.epochs):
         logger.info(f"Epoch {epoch + 1}/{args.epochs}")
 
-        train_loss = train_epoch(model, train_loader, optimizer, device, loss_fn=momentum_loss if args.model_type == "momentum" else (masked_mse_loss if args.loss_fn == "mse" else masked_l1_loss), accumulation_steps=args.accumulation_steps, task=args.model_type)
-        val_loss = validate(model, val_loader, device, loss_fn=momentum_loss if args.model_type == "momentum" else (masked_mse_loss if args.loss_fn == "mse" else masked_l1_loss), task=args.model_type)
+        train_loss = train_epoch(
+            model, train_loader, optimizer, device, scaler,
+            loss_fn=loss_fn, accumulation_steps=args.accumulation_steps, task=args.model_type,
+        )
+        val_loss = validate(model, val_loader, device, loss_fn=loss_fn, task=args.model_type)
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
 
+        # Step warmup per-batch during warmup epochs; then cosine per-epoch.
         if epoch < args.warmup_epochs:
-            warmup_scheduler.step()
+            for _ in range(len(train_loader)):
+                warmup_scheduler.step()
         else:
             cosine_scheduler.step()
 

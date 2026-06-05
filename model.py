@@ -71,6 +71,11 @@ class MaskedTransformerEncoder(nn.Module):
         self.input_projection = nn.Linear(input_dim, d_model)
         self.pos_encoding = PositionalEncoding(d_model, max_channels, dropout)
 
+        # Pre-registered scale factors so feature scaling is a single
+        # broadcast multiply with no extra tensor allocation per forward pass.
+        if input_dim == 2:
+            self.register_buffer("_feat_scale", torch.tensor([1.0 / 100.0, 1000.0]))
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -97,11 +102,9 @@ class MaskedTransformerEncoder(nn.Module):
             src_key_padding_mask: (batch, seq_len) boolean mask for sequence padding
             channel_indices: (batch, seq_len) unique detector channel identifier tokens
         """
-        # Out-of-place feature scaling to bring raw physics scales into O(1) bounds
+        # Single broadcast multiply — no cat, no extra allocation.
         if self.input_dim == 2:
-            t_diff_scaled = x[..., 0:1] / 100.0
-            edep_scaled = x[..., 1:2] * 1000.0
-            x_scaled = torch.cat([t_diff_scaled, edep_scaled], dim=-1)
+            x_scaled = x * self._feat_scale
         else:
             x_scaled = x
 
@@ -160,10 +163,8 @@ class MomentumPredictionHead(nn.Module):
 
         elif self.pooling_type == "max":
             if mask is not None:
-                real_mask = ~mask
-                encoded_masked = encoded.clone()
-                encoded_masked[mask] = float("-inf")
-                pooled = encoded_masked.max(dim=1).values
+                # masked_fill avoids an extra clone() allocation
+                pooled = encoded.masked_fill(mask.unsqueeze(-1), float("-inf")).max(dim=1).values
             else:
                 pooled = encoded.max(dim=1).values
 

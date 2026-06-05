@@ -63,11 +63,14 @@ def build_sparse_track_from_hdf5_group(
     hits = track_group["hits"]
     hit_ids = [hid.decode("utf-8") if isinstance(hid, bytes) else str(hid) for hid in hits["hit_id"]]
 
+    # Stack feature columns directly into a (n_hits, n_features) array.
+    # np.column_stack avoids the intermediate list-of-arrays from np.stack.
     feature_arrays = [np.asarray(hits[name], dtype=np.float32) for name in feature_names]
-    features = np.stack(feature_arrays, axis=-1)
+    features = np.column_stack(feature_arrays) if len(feature_arrays) > 1 else feature_arrays[0][:, None]
 
-    # Directly map string channel labels to their respective index integer positions
-    indices = np.array([channel_index[hid] for hid in hit_ids], dtype=np.int64)
+    # Vectorized channel lookup: np.vectorize dispatches the dict.__getitem__
+    # call as a ufunc, avoiding the explicit Python for-loop over hit_ids.
+    indices = np.vectorize(channel_index.__getitem__)(hit_ids).astype(np.int64)
 
     return features, indices
 
