@@ -75,6 +75,8 @@ class MaskedTransformerEncoder(nn.Module):
         # broadcast multiply with no extra tensor allocation per forward pass.
         if input_dim == 2:
             self.register_buffer("_feat_scale", torch.tensor([1.0 / 100.0, 1000.0]))
+        else:
+            self._feat_scale = None
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -103,7 +105,7 @@ class MaskedTransformerEncoder(nn.Module):
             channel_indices: (batch, seq_len) unique detector channel identifier tokens
         """
         # Single broadcast multiply — no cat, no extra allocation.
-        if self.input_dim == 2:
+        if self._feat_scale is not None:
             x_scaled = x * self._feat_scale
         else:
             x_scaled = x
@@ -119,16 +121,36 @@ class MaskedTransformerEncoder(nn.Module):
 
 
 class MomentumPredictionHead(nn.Module):
+    """
+    Pools the transformer output and predicts a 3D momentum vector.
+
+    Tracker-only mode (calo_dim=0, default):
+        MLP input = pooled tracker embedding (d_model,)
+        Identical to the original behaviour — no calo path is touched.
+
+    Tracker + calorimeter mode (calo_dim > 0):
+        MLP input = [pooled tracker embedding | calo scalars]  (d_model + calo_dim,)
+        The calo scalars are concatenated *after* pooling so the transformer
+        architecture is unchanged.  NaN values (unmatched tracks) must be
+        replaced with 0 by the caller; a calo_matched flag should be appended
+        as the last element so the model can learn to ignore calo when absent.
+
+    Switching between modes only requires changing calo_dim at construction
+    time — no other code changes are needed.
+    """
+
     def __init__(
         self,
         d_model: int,
         dim_feedforward: int = 256,
         dropout: float = 0.1,
         pooling_type: str = "mean",
+        calo_dim: int = 0,
     ):
         super().__init__()
         self.pooling_type = pooling_type
         self.d_model = d_model
+        self.calo_dim = calo_dim
 
         if pooling_type == "attention":
             self.attention_pooling = nn.MultiheadAttention(
@@ -136,19 +158,30 @@ class MomentumPredictionHead(nn.Module):
             )
             self.query_token = nn.Parameter(torch.randn(1, 1, d_model))
 
+        # MLP input width: tracker pooled embedding + optional calo scalars
+        mlp_input_dim = d_model + calo_dim
+
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
+            nn.Linear(mlp_input_dim, dim_feedforward),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward, dim_feedforward // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim_feedforward // 2, 3),  # Updated output dim from 1 to 3 for Px, Py, Pz
+            nn.Linear(dim_feedforward // 2, 3),  # Px, Py, Pz
         )
 
     def forward(
-        self, encoded: torch.Tensor, mask: Optional[torch.Tensor] = None
+        self, encoded: torch.Tensor, mask: Optional[torch.Tensor] = None,
+        calo_scalars: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Args:
+            encoded:      (batch, seq_len, d_model)
+            mask:         (batch, seq_len) True = padding
+            calo_scalars: (batch, calo_dim) or None
+                          Required when calo_dim > 0; ignored when calo_dim == 0.
+        """
         batch_size = encoded.size(0)
 
         if self.pooling_type == "mean":
@@ -175,6 +208,12 @@ class MomentumPredictionHead(nn.Module):
             )
             pooled = attn_out.squeeze(1)
 
+        # Concatenate calo scalars when in tracker+calo mode.
+        # When calo_dim == 0 this branch is never entered, so tracker-only
+        # runs have zero overhead from this code path.
+        if self.calo_dim > 0 and calo_scalars is not None:
+            pooled = torch.cat([pooled, calo_scalars], dim=-1)
+
         momentum_vector = self.mlp(pooled)
         return momentum_vector
 
@@ -193,12 +232,22 @@ class TrackReconstructionModel(nn.Module):
         task: str = "reconstruction",
         output_dim: Optional[int] = None,
         pooling_type: str = "mean",
+        calo_dim: int = 0,
     ):
+        """
+        Args:
+            calo_dim: Number of calorimeter scalar features to concatenate after
+                      pooling.  Set to 0 (default) for tracker-only training —
+                      the model is then identical to the original architecture.
+                      Set to len(CALO_SCALAR_COLS) + 1 (for the calo_matched flag)
+                      when training with calorimeter data.
+        """
         super().__init__()
         self.task = task
         self.input_dim = input_dim
         self.d_model = d_model
         self.max_channels = max_channels
+        self.calo_dim = calo_dim
 
         self.encoder = MaskedTransformerEncoder(
             input_dim=input_dim,
@@ -212,6 +261,7 @@ class TrackReconstructionModel(nn.Module):
         )
 
         if task == "reconstruction" or task == "denoising":
+            # Reconstruction head does not use calo scalars (hit-level output)
             self.head = nn.Linear(d_model, input_dim)
         elif task == "momentum":
             self.head = MomentumPredictionHead(
@@ -219,10 +269,11 @@ class TrackReconstructionModel(nn.Module):
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
                 pooling_type=pooling_type,
+                calo_dim=calo_dim,
             )
         elif task == "regression":
             self.head = nn.Sequential(
-                nn.Linear(d_model, dim_feedforward),
+                nn.Linear(d_model + calo_dim, dim_feedforward),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(dim_feedforward, output_dim),
@@ -233,11 +284,22 @@ class TrackReconstructionModel(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         channel_indices: Optional[torch.Tensor] = None,
+        calo_scalars: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Args:
+            x:              (batch, seq_len, input_dim)
+            mask:           (batch, seq_len) True = padding
+            channel_indices:(batch, seq_len)
+            calo_scalars:   (batch, calo_dim) or None
+                            Pass None (or omit) for tracker-only inference.
+                            Pass the NaN-replaced + calo_matched-appended tensor
+                            for tracker+calo inference.
+        """
         encoded = self.encoder(x, src_key_padding_mask=mask, channel_indices=channel_indices)
 
         if self.task == "momentum":
-            output = self.head(encoded, mask=mask)
+            output = self.head(encoded, mask=mask, calo_scalars=calo_scalars)
         else:
             output = self.head(encoded)
 

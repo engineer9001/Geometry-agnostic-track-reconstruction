@@ -55,6 +55,13 @@ def copy_track_groups(
         for key, value in src.attrs.items():
             dst.attrs[key] = value
 
+        # Copy group-level attributes from the source tracks/ group
+        # (has_calo, hit_feature_cols, track_scalar_attrs, has_momentum, etc.)
+        # These are written by track_aggregation.py and must be preserved so
+        # that preprocess_to_flat.py knows what data is available.
+        for key, value in src[group_root].attrs.items():
+            dest_root.attrs[key] = value
+
         for name in track_names:
             src_path = f"{group_root}/{name}"
             if src_path not in src:

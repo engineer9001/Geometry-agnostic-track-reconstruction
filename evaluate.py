@@ -1,12 +1,20 @@
 import argparse
 from pathlib import Path
+from typing import Tuple
 import json
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 
 from model import TrackReconstructionModel, TrackModelConfig
-from train import create_dataloaders
+from train import (
+    MultiFileMomentumDataset,
+    MomentumTrackDataset,
+    FlatMomentumDataset,
+    sparse_collate_fn,
+)
+from torch.utils.data import DataLoader
 
 
 def load_history(output_dir: Path):
@@ -76,7 +84,7 @@ def make_plots(history, v_true, v_pred, save_dir: Path):
         
         axes[i].hist(residuals[:, i], bins=50, color=color, edgecolor="black", alpha=0.7)
         axes[i].axvline(0, color="black", linestyle="-", alpha=0.5)
-        axes[i].set_xlabel(f"Residual ($\Delta P_{comp.lower()} = P_{comp.lower(), pred} - P_{comp.lower(), true}$) [MeV/c]", fontsize=11)
+        axes[i].set_xlabel(f"Residual $\\Delta P_{{{comp.lower()}}}$ = $P_{{{comp.lower()},pred}}$ - $P_{{{comp.lower()},true}}$ [MeV/c]", fontsize=11)
         axes[i].set_ylabel("Counts", fontsize=11)
         axes[i].set_title(f"$P_{comp.lower()}$ 1D Residual\nMean={mean_res:.3f}, Std={std_res:.3f}", fontsize=12, fontweight="bold")
         axes[i].grid(True, alpha=0.3)
@@ -90,7 +98,7 @@ def make_plots(history, v_true, v_pred, save_dir: Path):
     for i, comp in enumerate(components):
         # Using cmin=1 leaves empty bins perfectly white
         counts, xedges, yedges, im = axes[i].hist2d(
-            v_true[:, i], v_pred[:, i], bins=50, cmap="viridis", cmin=1
+            v_true[:, i], v_pred[:, i], bins=50, cmap="viridis", cmin=1, norm=LogNorm()
         )
         # Add ideal 45-degree reference line
         mn, mx = min(v_true[:, i]), max(v_true[:, i])
@@ -111,7 +119,7 @@ def make_plots(history, v_true, v_pred, save_dir: Path):
     
     # Left: Total Momentum 2D Distribution Histogram
     counts, xedges, yedges, im = ax1.hist2d(
-        p_true_tot, p_pred_tot, bins=50, cmap="plasma", cmin=1
+        p_true_tot, p_pred_tot, bins=50, cmap="plasma", cmin=1, norm=LogNorm()
     )
     mn, mx = min(p_true_tot), max(p_true_tot)
     ax1.plot([mn, mx], [mn, mx], color="black", linestyle="--", alpha=0.7, label="Ideal Perfect Fit")
@@ -136,6 +144,83 @@ def make_plots(history, v_true, v_pred, save_dir: Path):
     plt.savefig(save_dir / "total_momentum_diagnostics.png", dpi=200)
     plt.close()
     
+    # ------------------ PLOT 5: TRUE vs PREDICTED 1D DISTRIBUTIONS WITH RATIO ------------------
+    # Four panels: Px, Py, Pz, |P|_total
+    quantities = [
+        (v_true[:, 0], v_pred[:, 0], "$P_x$ [MeV/c]",     "dodgerblue"),
+        (v_true[:, 1], v_pred[:, 1], "$P_y$ [MeV/c]",     "crimson"),
+        (v_true[:, 2], v_pred[:, 2], "$P_z$ [MeV/c]",     "forestgreen"),
+        (p_true_tot,   p_pred_tot,   "$|P|$ [MeV/c]",     "darkorange"),
+    ]
+
+    fig, axes_grid = plt.subplots(
+        2, 4, figsize=(24, 8),
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08},
+        sharex="col",
+    )
+
+    for col, (true_vals, pred_vals, xlabel, color) in enumerate(quantities):
+        ax_main  = axes_grid[0, col]
+        ax_ratio = axes_grid[1, col]
+
+        # Shared bin edges covering both distributions
+        lo = min(true_vals.min(), pred_vals.min())
+        hi = max(true_vals.max(), pred_vals.max())
+        bins = np.linspace(lo, hi, 60)
+        centers = 0.5 * (bins[:-1] + bins[1:])
+
+        n_true, _ = np.histogram(true_vals, bins=bins)
+        n_pred, _ = np.histogram(pred_vals, bins=bins)
+
+        # Poisson statistical errors: sqrt(N), with floor of 1 to avoid /0
+        err_true = np.sqrt(np.maximum(n_true, 1))
+        err_pred = np.sqrt(np.maximum(n_pred, 1))
+
+        # Main panel: step histograms + error bars
+        ax_main.step(bins, np.append(n_true, n_true[-1]), where="post",
+                     color="black", lw=1.5, label="True")
+        ax_main.errorbar(centers, n_true, yerr=err_true,
+                         fmt="none", color="black", capsize=2, lw=1)
+
+        ax_main.step(bins, np.append(n_pred, n_pred[-1]), where="post",
+                     color=color, lw=1.5, linestyle="--", label="Predicted", alpha=0.85)
+        ax_main.errorbar(centers, n_pred, yerr=err_pred,
+                         fmt="none", color=color, capsize=2, lw=1, alpha=0.85)
+
+        ax_main.set_ylabel("Tracks / Bin", fontsize=11)
+        ax_main.set_title(xlabel, fontsize=13, fontweight="bold")
+        ax_main.legend(fontsize=10)
+        ax_main.grid(True, linestyle="--", alpha=0.4)
+        ax_main.set_xlim(lo, hi)
+
+        # Ratio panel: pred / true, with propagated uncertainty
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where(n_true > 0, n_pred / n_true, np.nan)
+            # Propagated relative error: sqrt((err_pred/n_pred)^2 + (err_true/n_true)^2) * ratio
+            rel_err = np.where(
+                (n_true > 0) & (n_pred > 0),
+                ratio * np.sqrt((err_pred / np.maximum(n_pred, 1))**2 +
+                                (err_true / np.maximum(n_true, 1))**2),
+                np.nan,
+            )
+
+        ax_ratio.axhline(1.0, color="black", lw=1.2, linestyle="-")
+        ax_ratio.fill_between(centers, 1 - 0.1, 1 + 0.1,
+                              color="gray", alpha=0.15, label="±10%")
+        ax_ratio.errorbar(centers, ratio, yerr=rel_err,
+                          fmt="o", color=color, markersize=3, capsize=2, lw=1)
+
+        ax_ratio.set_xlabel(xlabel, fontsize=11)
+        ax_ratio.set_ylabel("Pred / True", fontsize=10)
+        ax_ratio.set_ylim(0.5, 1.5)
+        ax_ratio.grid(True, linestyle="--", alpha=0.4)
+        ax_ratio.set_xlim(lo, hi)
+
+    fig.suptitle("Predicted vs True Momentum Distributions", fontsize=15, fontweight="bold", y=1.01)
+    plt.tight_layout()
+    plt.savefig(save_dir / "distribution_comparison.png", dpi=200, bbox_inches="tight")
+    plt.close()
+
     print(f"Success! High-statistics tracking diagnostic dashboards saved to: {save_dir.resolve()}")
 
 
@@ -144,6 +229,13 @@ def main():
     parser.add_argument("test_data", help="Path to evaluation HDF5 folder or validation file split")
     parser.add_argument("--run-dir", required=True, help="Path containing best_model.pt and history.json")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--flat-format", action="store_true", default=False,
+                        help="Use flat CSR HDF5 format produced by preprocess_to_flat.py.")
+    parser.add_argument("--forward-only", action="store_true", default=False,
+                        help="Restrict evaluation to forward-going tracks (pz > 0). "
+                             "Should match the --forward-only flag used during training.")
     args = parser.parse_args()
 
     run_path = Path(args.run_dir)
@@ -158,16 +250,28 @@ def main():
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
 
-    # 2. Build standard tracker channel layout layout
+    # 2. Build standard tracker channel layout
     print("Building channel index mapping...")
     channel_index = {f"{p}_{pa}_{l}_{s}": idx for idx, (p, pa, l, s) in enumerate(
         [(p, pa, l, s) for p in range(36) for pa in range(6) for l in range(2) for s in range(96)]
     )}
 
     # 3. Create evaluation data loader
-    _, test_loader = create_dataloaders(
-        args.test_data, args.test_data, channel_index,
-        batch_size=64, num_workers=2, task="momentum"
+    pz_min = 0.0 if args.forward_only else None
+    test_path = Path(args.test_data)
+    if args.flat_format:
+        test_dataset = FlatMomentumDataset(args.test_data, pz_min=pz_min)
+    elif test_path.is_dir():
+        test_dataset = MultiFileMomentumDataset(args.test_data, channel_index)
+    else:
+        test_dataset = MomentumTrackDataset(args.test_data, channel_index)
+
+    test_loader = DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
+        collate_fn=sparse_collate_fn,
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=(2 if args.num_workers > 0 else None),
     )
 
     # 4. Extract arrays and generate plots
