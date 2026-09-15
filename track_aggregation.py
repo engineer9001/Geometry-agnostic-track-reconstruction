@@ -11,7 +11,11 @@ import glob
 # These are the per-hit quantities that vary within a track.
 HIT_FEATURE_COLS = [
     'hit_id',       # string — channel identifier (plane_panel_layer_straw)
+    't0',           # float32 — absolute time at wire end 0 [ns]
+    't1',           # float32 — absolute time at wire end 1 [ns]
     't_diff',       # float32 — time difference between the two wire ends [ns]
+    'tot0',         # float32 — time-over-threshold at wire end 0 [ns/counts]
+    'tot1',         # float32 — time-over-threshold at wire end 1 [ns/counts]
     'edep',         # float32 — energy deposit [MeV]
     'x_position',   # float32 — POCA x [mm]
     'y_position',   # float32 — POCA y [mm]
@@ -70,37 +74,9 @@ def aggregate_hits_to_hdf5(hit_df, h5_path, group_root='tracks',
                             detect_duplicates=False, calo_hits_dict=None):
     """
     Write per-track HDF5 groups. Each track becomes a group under `/{group_root}`.
-
-    Group attributes (track-level scalars):
-        event_index, track_index
-        true_mom_x, true_mom_y, true_mom_z   (MC truth)
-        calo_matched, calo_edep, calo_ctime, calo_did, ...  (calorimeter cluster)
-
-    Dataset 'hits' (structured array, one row per hit):
-        hit_id      : utf-8 string  (plane_panel_layer_straw)
-        t_diff      : float32
-        edep        : float32
-        x_position  : float32
-        y_position  : float32
-        z_position  : float32
-        hit_rho     : float32
-        hit_position: float32
-
-    Dataset 'calo_hits' (structured array, one row per crystal hit, optional):
-        crystal_id  : int32   — crystal channel ID (0–1338)
-        edep        : float32 — energy deposit [MeV]
-        edep_err    : float32 — energy deposit uncertainty [MeV]
-        time        : float32 — hit time [ns]
-        time_err    : float32 — hit time uncertainty [ns]
-        n_sipms     : int32   — number of SiPMs that fired
-        pos_x       : float32 — crystal centre x [mm]
-        pos_y       : float32 — crystal centre y [mm]
-        pos_z       : float32 — crystal centre z [mm]
-        Written only when calo_hits_dict is provided and the track has a calo match.
-        Unmatched tracks get an empty (shape 0) calo_hits dataset.
+    Straw hit absolute times (t0, t1) and associated calorimeter timestamps 
+    are shifted relative to the earliest hit in the track.
     """
-
-    # Determine which hit feature columns are actually present
     available_hit_cols = [c for c in HIT_FEATURE_COLS if c in hit_df.columns]
     available_scalar_attrs = [c for c in TRACK_SCALAR_ATTRS if c in hit_df.columns]
 
@@ -117,7 +93,6 @@ def aggregate_hits_to_hdf5(hit_df, h5_path, group_root='tracks',
     with h5py.File(h5_path, 'w') as f:
         root = f.require_group(group_root)
 
-        # Store metadata about what's in this file
         root.attrs['hit_feature_cols']    = available_hit_cols
         root.attrs['track_scalar_attrs']  = available_scalar_attrs
         root.attrs['has_momentum']        = has_momentum
@@ -128,7 +103,6 @@ def aggregate_hits_to_hdf5(hit_df, h5_path, group_root='tracks',
         fingerprints = {} if detect_duplicates else None
         stats = {'stored': 0, 'nan_mom': 0, 'calo_matched': 0, 'calo_unmatched': 0}
 
-        # Dtype for per-crystal calo hits dataset
         CALO_HIT_DTYPE = np.dtype([
             ('crystal_id', np.int32),
             ('edep',       np.float32),
@@ -144,6 +118,20 @@ def aggregate_hits_to_hdf5(hit_df, h5_path, group_root='tracks',
         for i, ((event_idx, track_idx), group) in enumerate(tqdm(grouped, desc='Writing HDF5 tracks', unit='track')):
             gname = f"track_{i}"
             g = root.create_group(gname)
+
+            # --- Calculate track-level earliest straw hit time (track_t0) ---
+            has_t0 = 't0' in group.columns
+            has_t1 = 't1' in group.columns
+            if has_t0 or has_t1:
+                times_to_check = []
+                if has_t0: times_to_check.append(group['t0'].min())
+                if has_t1: times_to_check.append(group['t1'].min())
+                track_t0 = float(np.nanmin(times_to_check))
+            else:
+                track_t0 = 0.0
+
+            # Save absolute reference anchor metadata
+            g.attrs['track_t0'] = track_t0
 
             # --- Track-level attributes ---
             try:
@@ -176,15 +164,18 @@ def aggregate_hits_to_hdf5(hit_df, h5_path, group_root='tracks',
 
                 for col in available_scalar_attrs:
                     if col in ('true_mom_x', 'true_mom_y', 'true_mom_z', 'calo_matched'):
-                        continue  # already handled above
+                        continue
                     val = group[col].iloc[0]
-                    # Store NaN as a special float — h5py handles float NaN fine
+                    
+                    # Shift cluster time relative to earliest track hit
+                    if col == 'calo_ctime' and not np.isnan(val):
+                        val = val - track_t0
+                        
                     g.attrs[col] = float(val) if not isinstance(val, bool) else bool(val)
 
             # --- Hit-level dataset ---
             n = len(group)
             if n == 0:
-                # Build empty dtype and create empty dataset
                 dt = _build_hit_dtype(available_hit_cols)
                 g.create_dataset('hits', shape=(0,), dtype=dt)
                 continue
@@ -195,7 +186,11 @@ def aggregate_hits_to_hdf5(hit_df, h5_path, group_root='tracks',
             for col in available_hit_cols:
                 if col == 'hit_id':
                     data['hit_id'] = group['hit_id'].astype(str).values
+                elif col in ('t0', 't1'):
+                    # Transform absolute times to relative times
+                    data[col] = (group[col] - track_t0).astype(np.float32).values
                 else:
+                    # Automatically captures tot0, tot1, edep, and position scalars
                     data[col] = group[col].astype(np.float32).values
 
             g.create_dataset('hits', data=data, compression='gzip')
@@ -206,6 +201,11 @@ def aggregate_hits_to_hdf5(hit_df, h5_path, group_root='tracks',
                               calo_hits_dict.get((event_idx, track_idx), None))
                 if crystal_arr is None:
                     crystal_arr = np.zeros(0, dtype=CALO_HIT_DTYPE)
+                else:
+                    # Shift individual crystal times to match the local track clock
+                    crystal_arr = crystal_arr.copy()
+                    crystal_arr['time'] = crystal_arr['time'] - track_t0
+                    
                 g.create_dataset('calo_hits', data=crystal_arr, compression='gzip')
 
             # Duplicate detection (optional)
@@ -215,39 +215,6 @@ def aggregate_hits_to_hdf5(hit_df, h5_path, group_root='tracks',
                 edeps   = group['edep'].astype(np.float32).values
                 fp = _fingerprint_hit_group(hit_ids, t_diffs, edeps)
                 fingerprints.setdefault(fp, []).append((i, event_idx, track_idx))
-
-        # Summary
-        n_written = stats['stored'] + stats['nan_mom'] + stats['calo_unmatched'] + stats['calo_matched']
-        print(f"\nTrack storage summary:")
-        print(f"  ✓ Tracks written: {n_written}")
-        if has_momentum:
-            print(f"  ✓ Momentum stored: {stats['stored']} tracks")
-            if stats['nan_mom'] > 0:
-                print(f"  ⚠ NaN momentum (not stored): {stats['nan_mom']} tracks")
-        if has_calo:
-            print(f"  ✓ Calo matched: {stats['calo_matched']} tracks")
-            print(f"  ✓ Calo unmatched: {stats['calo_unmatched']} tracks")
-        if calo_hits_dict is not None:
-            n_with_crystals = sum(1 for v in calo_hits_dict.values() if len(v) > 0)
-            print(f"  ✓ Tracks with crystal hits: {n_with_crystals}")
-
-        if detect_duplicates:
-            dupes = {k: v for k, v in fingerprints.items() if len(v) > 1}
-            if dupes:
-                print('\nDuplicate track fingerprints detected:')
-                for fp, entries in dupes.items():
-                    print(f'Fingerprint {fp} occurs {len(entries)} times:')
-                    for (idx, ev, tr) in entries:
-                        print(f'  - group_index={idx}, event={ev}, track={tr}')
-                    print('\nDiagnostic samples for this fingerprint:')
-                    for (idx, ev, tr) in entries:
-                        sel = hit_df[(hit_df['event_index'] == ev) & (hit_df['track_index'] == tr)]
-                        print(f'-- event={ev}, track={tr}, rows={len(sel)}')
-                        if len(sel) > 0:
-                            print(sel[['hit_id', 't_diff', 'edep']].head(5).to_string(index=False))
-                        print('')
-            else:
-                print('\nNo duplicate track fingerprints found.')
 
 
 def _build_hit_dtype(available_hit_cols):
@@ -327,17 +294,40 @@ def check_multi_track_duplication(hit_df):
     return {'multi_events': len(multi_events), 'multi_events_with_dupes': n_multi_events_with_dupes, 'dupe_track_pairs': n_dupe_pairs}
 
 
-if __name__ == '__main__':
+import multiprocessing
+import gc
 
+def process_single_file(root_file, out_h5):
+    """Worker function executed in an isolated process."""
+    root_basename = os.path.basename(root_file)
+    print(f"Processing: {root_basename}")
+    
+    # Import extractor inside worker or module top-level
     from uproot_data_extractor import uproot_data_extractor
-    mldata_dir = '/exp/mu2e/app/users/dgmyers/MLWork_EAF/DOA/MLData'
+    
+    hit_df, calo_hits_dict = uproot_data_extractor(root_file)
+
+    if hit_df.empty:
+        print(f"  Skipped (empty dataframe)\n")
+        return
+
+    aggregate_hits_to_hdf5(
+        hit_df, 
+        out_h5, 
+        detect_duplicates=False,
+        calo_hits_dict=calo_hits_dict
+    )
+    print(f"  Wrote: {out_h5}\n")
+
+
+if __name__ == '__main__':
+    mldata_dir = '/pnfs/mu2e/scratch/users/dgmyers/mixednTupleSignalAndDIO'
     h5_out_dir = os.path.join(mldata_dir, 'h5Files')
-    root_files = sorted(glob.glob(os.path.join(mldata_dir, 'rootFiles', '*.root')))
+    root_files = sorted(glob.glob(os.path.join(mldata_dir, 'nTupleFiles', '*.root')))
 
     if not root_files:
-        print(f"No .root files found in {mldata_dir}/rootFiles/")
+        print(f"No .root files found in {mldata_dir}/nTupleFiles/")
     else:
-        # Ensure output directory exists
         os.makedirs(h5_out_dir, exist_ok=True)
         print(f"Found {len(root_files)} .root file(s)")
         print(f"Output directory: {h5_out_dir}\n")
@@ -352,15 +342,15 @@ if __name__ == '__main__':
                 print(f"  Already exists, skipping: {h5_basename}")
                 continue
 
-            print(f"Processing: {root_basename}")
-            hit_df, calo_hits_dict = uproot_data_extractor(root_file)
+            # Spawns a clean process for the file
+            p = multiprocessing.Process(
+                target=process_single_file, 
+                args=(root_file, out_h5)
+            )
+            p.start()
+            p.join()  # Wait for process to complete and fully purge RAM before continuing
 
-            if hit_df.empty:
-                print(f"  Skipped (empty dataframe)\n")
-                continue
+            # Force host Python garbage collection between files
+            gc.collect()
 
-            aggregate_hits_to_hdf5(hit_df, out_h5, detect_duplicates=False,
-                                   calo_hits_dict=calo_hits_dict)
-            print(f"  Wrote: {out_h5}\n")
-
-        print("\nAll files processed.")
+        print("\nAll files processed successfully.")

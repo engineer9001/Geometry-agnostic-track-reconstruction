@@ -8,6 +8,9 @@ import hashlib
 # Sentinel value used in TrkAna when a track has no calorimeter match
 _CALO_SENTINEL = -1000.0
 
+# MCRelationship::same identifies the primary particle itself.
+_MC_RELATION_SAME = 0
+
 
 def _calo_scalar(arr_2d, event_idx, tidx):
     """Extract scalar calo value for track tidx in event event_idx; sentinel → NaN."""
@@ -41,6 +44,34 @@ def _track_fingerprint(hit_ids, t_diffs, edeps):
     return m.hexdigest()
 
 
+def _primary_truth_momentum(px, py, pz, primary_relation):
+    """Return momentum for the MC particle identified as the event primary.
+
+    ``prirel`` is a split ``mu2e::MCRelationship`` record.  Its ``_rel`` value
+    is ``MCRelationship::same`` (0) for the primary particle itself; value 1
+    means ``daughter`` and is not a primary-particle flag.
+    """
+    px = np.asarray(px)
+    py = np.asarray(py)
+    pz = np.asarray(pz)
+    primary_relation = np.asarray(primary_relation)
+
+    expected_size = len(px)
+    if not all(len(values) == expected_size
+               for values in (py, pz, primary_relation)):
+        raise ValueError('Inconsistent trkmcsim contributor-array lengths')
+
+    primary_indices = np.flatnonzero(primary_relation == _MC_RELATION_SAME)
+    if len(primary_indices) == 0:
+        return np.nan, np.nan, np.nan
+    if len(primary_indices) > 1:
+        raise ValueError('Multiple trkmcsim contributors match the primary particle')
+
+    primary_idx = int(primary_indices[0])
+    return (float(px[primary_idx]), float(py[primary_idx]),
+            float(pz[primary_idx]))
+
+
 def uproot_data_extractor(filepaths_string):
     """
     Extracts Mu2e tracker hit data AND calorimeter crystal hit data directly
@@ -50,7 +81,7 @@ def uproot_data_extractor(filepaths_string):
 
     hit_df : pd.DataFrame
         One row per tracker straw hit. Columns include hit_id, x/y/z_position,
-        hit_rho, hit_position, edep, t_diff, true_mom_x/y/z, calo_matched,
+        hit_rho, hit_position, edep, t0, t1, t_diff, true_mom_x/y/z, calo_matched,
         and all calo_* cluster-level scalars (same value repeated for every
         hit row belonging to that track).
 
@@ -169,6 +200,7 @@ def uproot_data_extractor(filepaths_string):
         r_hit_targets   = np.sqrt(xpos_targets ** 2 + ypos_targets ** 2 + zpos_targets ** 2)
 
         endtime = hits['etime']
+        tot     = hits['tot']
         edep    = hits['edep']
 
         # --- Extract Track-Level MC True INITIAL Momentum Components ---
@@ -176,6 +208,8 @@ def uproot_data_extractor(filepaths_string):
         mom_x = mcsim['mom']['fCoordinates']['fX']
         mom_y = mcsim['mom']['fCoordinates']['fY']
         mom_z = mcsim['mom']['fCoordinates']['fZ']
+        # prirel is a split MCRelationship record; _rel carries its enum value.
+        primary_relation = mcsim['prirel']['_rel']
 
         # --- Extract Track-Level Calorimeter Cluster (one per track) ---
         calo = trkana["trkcalohit"]
@@ -268,6 +302,10 @@ def uproot_data_extractor(filepaths_string):
                 t1_arr     = time_entry[:, 1]
                 t_diff_arr = t1_arr - t0_arr
 
+                tot_entry  = ak.to_numpy(tot[count][track_idx])
+                tot0_arr   = tot_entry[:, 0]
+                tot1_arr   = tot_entry[:, 1]
+
                 hit_id_strings = (
                     p_arr.astype(str) + "_" +
                     pa_arr.astype(str) + "_" +
@@ -282,19 +320,13 @@ def uproot_data_extractor(filepaths_string):
                 seen_track_fps.add(fp)
                 dedup_track_idx = len(seen_track_fps) - 1
 
-                # --- MC true momentum (primary matched particle, index 0) ---
+                # --- MC truth label from the true primary particle ---
                 track_mc_px = mom_x[count][track_idx]
                 track_mc_py = mom_y[count][track_idx]
                 track_mc_pz = mom_z[count][track_idx]
-
-                if len(track_mc_px) > 0:
-                    t_px = float(track_mc_px[0])
-                    t_py = float(track_mc_py[0])
-                    t_pz = float(track_mc_pz[0])
-                else:
-                    t_px = np.nan
-                    t_py = np.nan
-                    t_pz = np.nan
+                track_mc_prirel = primary_relation[count][track_idx]
+                t_px, t_py, t_pz = _primary_truth_momentum(
+                    track_mc_px, track_mc_py, track_mc_pz, track_mc_prirel)
 
                 # --- Calorimeter cluster scalars for this track ---
                 c_edep       = _calo_scalar(calo_edep,       count, track_idx)
@@ -366,6 +398,10 @@ def uproot_data_extractor(filepaths_string):
                     'hit_rho'      : rho_arr,
                     'hit_position' : r_arr,
                     'edep'         : e_arr,
+                    'tot0'         : tot0_arr,
+                    'tot1'         : tot1_arr,
+                    't0'           : t0_arr,
+                    't1'           : t1_arr,
                     't_diff'       : t_diff_arr,
                     'true_mom_x'   : np.full(n_hits, t_px),
                     'true_mom_y'   : np.full(n_hits, t_py),

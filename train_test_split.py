@@ -41,8 +41,8 @@ def copy_track_groups(
     group_root: str = "tracks",
 ) -> None:
     """Copy a subset of track groups from one HDF5 file into another.
-    
-    Using src.copy() naturally guarantees that your 3D target components 
+
+    Using src.copy() naturally guarantees that your 3D target components
     (true_mom_x, true_mom_y, true_mom_z) are preserved as metadata attributes.
     """
     with h5py.File(src_h5_path, "r") as src, h5py.File(dst_h5_path, "w") as dst:
@@ -106,35 +106,85 @@ def list_source_h5_files(
     return source_files
 
 
+def _split_outputs_for(src_path: Path) -> Tuple[Path, Path]:
+    """Return (train_path, val_path) sibling paths for a given source file."""
+    train_h5_path = src_path.with_name(src_path.stem + "_train.h5")
+    val_h5_path = src_path.with_name(src_path.stem + "_val.h5")
+    return train_h5_path, val_h5_path
+
+
 def split_h5_directory(
     source_dir: str,
     train_fraction: float = 0.8,
     seed: int = 42,
     shuffle: bool = True,
     group_root: str = "tracks",
-) -> List[Tuple[str, int, int, str, str]]:
-    """Split every eligible HDF5 file in a directory into train/validation outputs."""
+    skip_existing: bool = True,
+) -> Tuple[
+    List[Tuple[str, int, int, str, str]],  # successful splits
+    List[Tuple[str, str, str]],             # skipped (src, train_out, val_out)
+    List[Tuple[str, str]],                  # failed (src, error message)
+]:
+    """Split every eligible HDF5 file in a directory into train/validation outputs.
+
+    - If ``skip_existing`` is True (default), source files whose ``*_train.h5``
+      AND ``*_val.h5`` siblings already exist are skipped and reported.
+    - Any source file that fails to open or split (e.g. corrupt HDF5, missing
+      group root) is caught, recorded, and reported at the end instead of
+      crashing the whole run.
+
+    Returns
+    -------
+    (successful, skipped, failed) where
+      successful : list of (src, n_train, n_val, train_out, val_out)
+      skipped    : list of (src, train_out, val_out)
+      failed     : list of (src, error_message)
+    """
     source_files = list_source_h5_files(source_dir)
     if not source_files:
         raise ValueError(f"No eligible .h5 files found in directory '{source_dir}'.")
 
-    results = []
+    results: List[Tuple[str, int, int, str, str]] = []
+    skipped: List[Tuple[str, str, str]] = []
+    failed:  List[Tuple[str, str]] = []
+
     for src in source_files:
         src_path = Path(src)
-        train_h5_path = src_path.with_name(src_path.stem + "_train.h5")
-        val_h5_path = src_path.with_name(src_path.stem + "_val.h5")
-        n_train, n_val = split_h5_file(
-            src,
-            str(train_h5_path),
-            str(val_h5_path),
-            train_fraction=train_fraction,
-            seed=seed,
-            shuffle=shuffle,
-            group_root=group_root,
-        )
+        train_h5_path, val_h5_path = _split_outputs_for(src_path)
+
+        if skip_existing and train_h5_path.exists() and val_h5_path.exists():
+            skipped.append((src, str(train_h5_path), str(val_h5_path)))
+            continue
+
+        try:
+            n_train, n_val = split_h5_file(
+                src,
+                str(train_h5_path),
+                str(val_h5_path),
+                train_fraction=train_fraction,
+                seed=seed,
+                shuffle=shuffle,
+                group_root=group_root,
+            )
+        except (OSError, KeyError, ValueError, RuntimeError) as e:
+            # Common failure modes:
+            #   - OSError: corrupt/truncated HDF5 ("bad object header version
+            #     number", "unable to open file", etc.)
+            #   - KeyError: missing group_root (not a track file)
+            #   - RuntimeError / ValueError: internal libhdf5 issues
+            # Clean up any partial outputs so a subsequent run can retry.
+            for partial in (train_h5_path, val_h5_path):
+                try:
+                    if partial.exists():
+                        partial.unlink()
+                except OSError:
+                    pass
+            failed.append((src, f"{type(e).__name__}: {e}"))
+            continue
+
         results.append((src, n_train, n_val, str(train_h5_path), str(val_h5_path)))
 
-    return results
+    return results, skipped, failed
 
 
 def parse_args() -> argparse.Namespace:
@@ -177,6 +227,13 @@ def parse_args() -> argparse.Namespace:
         default="tracks",
         help="HDF5 group root containing the track groups (default: tracks).",
     )
+    parser.add_argument(
+        "--no-skip-existing",
+        action="store_true",
+        help="When splitting a directory, do NOT skip source files whose "
+             "'_train.h5' and '_val.h5' siblings already exist (they are "
+             "skipped by default).",
+    )
     return parser.parse_args()
 
 
@@ -188,20 +245,44 @@ def main() -> None:
         if args.train_out or args.val_out:
             raise ValueError("--train-out and --val-out cannot be used when source is a directory.")
 
-        results = split_h5_directory(
+        results, skipped, failed = split_h5_directory(
             str(source_path),
             train_fraction=args.train_fraction,
             seed=args.seed,
             shuffle=not args.no_shuffle,
             group_root=args.group_root,
+            skip_existing=not args.no_skip_existing,
         )
 
         total_train = sum(r[1] for r in results)
         total_val = sum(r[2] for r in results)
         print(f"Processed {len(results)} source .h5 files from {source_path}:")
         for src, n_train, n_val, train_out, val_out in results:
-            print(f"  {Path(src).name}: {n_train} train, {n_val} val -> {Path(train_out).name}, {Path(val_out).name}")
+            print(f"  {Path(src).name}: {n_train} train, {n_val} val -> "
+                  f"{Path(train_out).name}, {Path(val_out).name}")
         print(f"Total: {total_train} train tracks, {total_val} val tracks")
+
+        if skipped:
+            print(
+                f"\nSkipped {len(skipped)} source file(s) whose _train.h5 and "
+                f"_val.h5 siblings already exist:"
+            )
+            for src, train_out, val_out in skipped:
+                print(f"  {Path(src).name}  (already have "
+                      f"{Path(train_out).name} + {Path(val_out).name})")
+
+        if failed:
+            print(
+                f"\nWARNING: {len(failed)} source file(s) could not be split "
+                f"and were skipped:"
+            )
+            for src, err in failed:
+                print(f"  {Path(src).name}: {err}")
+            print(
+                "\nThese files were likely corrupt / truncated HDF5 files. "
+                "Any partial outputs have been removed. Consider deleting or "
+                "regenerating the listed source files."
+            )
         return
 
     if not source_path.is_file():
