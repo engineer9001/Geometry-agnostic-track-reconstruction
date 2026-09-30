@@ -145,6 +145,9 @@ def make_abs_momentum_plots(history, v_true_xyz, v_pred_abs, save_dir: Path):
 
     plt.tight_layout()
     plt.savefig(save_dir / "component_1d_residuals.png", dpi=200)
+    for ax in axes:
+        ax.set_yscale("linear")
+    plt.savefig(save_dir / "component_1d_residuals_linear.png", dpi=200)
     plt.close()
 
     # ------------------ PLOT 3: 2D COMPONENT CORRELATIONS ------------------
@@ -195,6 +198,8 @@ def make_abs_momentum_plots(history, v_true_xyz, v_pred_abs, save_dir: Path):
 
     plt.tight_layout()
     plt.savefig(save_dir / "total_momentum_diagnostics.png", dpi=200)
+    ax2.set_yscale("linear")
+    plt.savefig(save_dir / "total_momentum_diagnostics_linear.png", dpi=200)
     plt.close()
 
     # ------------------ PLOT 5: TRUE vs PREDICTED 1D DISTRIBUTIONS WITH RATIO ------------------
@@ -267,6 +272,9 @@ def make_abs_momentum_plots(history, v_true_xyz, v_pred_abs, save_dir: Path):
                  fontsize=15, fontweight="bold", y=1.01)
     plt.tight_layout()
     plt.savefig(save_dir / "distribution_comparison.png", dpi=200, bbox_inches="tight")
+    for ax_main in axes_grid[0]:
+        ax_main.set_yscale("linear")
+    plt.savefig(save_dir / "distribution_comparison_linear.png", dpi=200, bbox_inches="tight")
     plt.close()
 
     print(f"Success! abs_momentum diagnostic dashboards saved to: {save_dir.resolve()}")
@@ -317,6 +325,9 @@ def make_plots(history, v_true, v_pred, save_dir: Path):
         
     plt.tight_layout()
     plt.savefig(save_dir / "component_1d_residuals.png", dpi=200)
+    for ax in axes:
+        ax.set_yscale("linear")
+    plt.savefig(save_dir / "component_1d_residuals_linear.png", dpi=200)
     plt.close()
 
     # ------------------ PLOT 3: 2D COMPONENT CORRELATIONS ------------------
@@ -365,6 +376,8 @@ def make_plots(history, v_true, v_pred, save_dir: Path):
     
     plt.tight_layout()
     plt.savefig(save_dir / "total_momentum_diagnostics.png", dpi=200)
+    ax2.set_yscale("linear")
+    plt.savefig(save_dir / "total_momentum_diagnostics_linear.png", dpi=200)
     plt.close()
     
     # ------------------ PLOT 5: TRUE vs PREDICTED 1D DISTRIBUTIONS WITH RATIO ------------------
@@ -437,6 +450,9 @@ def make_plots(history, v_true, v_pred, save_dir: Path):
     fig.suptitle("Predicted vs True Momentum Distributions", fontsize=15, fontweight="bold", y=1.01)
     plt.tight_layout()
     plt.savefig(save_dir / "distribution_comparison.png", dpi=200, bbox_inches="tight")
+    for ax_main in axes_grid[0]:
+        ax_main.set_yscale("linear")
+    plt.savefig(save_dir / "distribution_comparison_linear.png", dpi=200, bbox_inches="tight")
     plt.close()
 
     print(f"Success! High-statistics tracking diagnostic dashboards saved to: {save_dir.resolve()}")
@@ -458,6 +474,11 @@ def main():
     parser.add_argument("--forward-only", action="store_true", default=False,
                         help="Restrict evaluation to forward-going tracks (pz > 0). "
                              "Should match the --forward-only flag used during training.")
+    parser.add_argument("--require-calo", action="store_true", default=False,
+                        help="Keep only tracks associated with a calorimeter "
+                             "cluster, using the flat-file calo_matched field. "
+                             "This filters samples only and does not enable "
+                             "calorimeter input features.")
     args = parser.parse_args()
 
     run_path = Path(args.run_dir)
@@ -484,13 +505,26 @@ def main():
     if is_flat and not args.flat_format:
         print("Auto-detected flat CSR HDF5 layout — using FlatMomentumDataset. "
               "Pass --flat-format explicitly to silence this notice.")
+    if args.require_calo and not is_flat:
+        parser.error(
+            "--require-calo requires flat CSR HDF5 data containing the "
+            "calo_matched dataset"
+        )
 
     if is_flat:
-        test_dataset = FlatMomentumDataset(args.test_data)
+        test_dataset = FlatMomentumDataset(
+            args.test_data, require_calo=args.require_calo
+        )
     elif test_path.is_dir():
         test_dataset = MultiFileMomentumDataset(args.test_data, channel_index)
     else:
         test_dataset = MomentumTrackDataset(args.test_data, channel_index)
+
+    if args.require_calo:
+        print(
+            f"--require-calo selected {len(test_dataset):,} calo-matched tracks; "
+            "the model feature configuration is unchanged."
+        )
 
     if len(test_dataset) == 0:
         raise RuntimeError(

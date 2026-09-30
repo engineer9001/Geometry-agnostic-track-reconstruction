@@ -4,7 +4,10 @@ import logging
 import math
 import os
 import pickle
+import shlex
+import sys
 import threading
+import warnings
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Tuple, Dict, Any, List
@@ -31,10 +34,12 @@ from model import (
 from nedt import build_sparse_track_from_hdf5_group, infer_channel_index_from_hdf5
 
 
-def setup_logging(log_dir: Path) -> logging.Logger:
-    """Set up logging to file and console."""
+def setup_logging(log_dir: Path, command: str) -> logging.Logger:
+    """Set up logging to file and console, recording the invocation first."""
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(f"{command}\n")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -372,8 +377,12 @@ class FlatMomentumDataset(Dataset):
         contained reconstruction outputs (calo_mom_x/y/z, calo_poca_*,
         tresid, etc.) that effectively leaked the target momentum.
 
-    Requires flat files produced by the *updated* preprocess_to_flat.py
-    (n_calo_hit_feats == 3, calo_hit_feat_names == ["crystal_id", "edep", "time"]).
+    ``require_calo=True`` filters the index to tracks whose ``calo_matched``
+    field is true; it does not change the returned features or enable calo input.
+
+    Calo input requires flat files produced by the *updated*
+    preprocess_to_flat.py (n_calo_hit_feats == 3,
+    calo_hit_feat_names == ["crystal_id", "edep", "time"]).
     """
 
     def __init__(
@@ -381,14 +390,33 @@ class FlatMomentumDataset(Dataset):
         data_path: str,
         max_tracks: Optional[int] = None,
         use_calo: bool = False,
+        require_calo: bool = False,
     ):
         p = Path(data_path)
         if p.is_dir():
-            self.h5_files = [str(x) for x in sorted(p.glob("*.h5"))]
+            candidates = sorted(p.glob("*.h5"))
         elif p.is_file():
-            self.h5_files = [str(p)]
+            candidates = [p]
         else:
             raise FileNotFoundError(f"Path does not exist: {data_path}")
+
+        valid_files = [path for path in candidates if h5py.is_hdf5(path)]
+        skipped_files = [path for path in candidates if not h5py.is_hdf5(path)]
+        if skipped_files:
+            examples = ", ".join(str(path) for path in skipped_files[:3])
+            suffix = "" if len(skipped_files) <= 3 else ", ..."
+            warnings.warn(
+                f"Skipping {len(skipped_files)} non-HDF5 '*.h5' file(s) under "
+                f"{p}: {examples}{suffix}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if not valid_files:
+            raise RuntimeError(
+                f"No valid HDF5 files found at {data_path}; found "
+                f"{len(candidates)} '*.h5' candidate(s)."
+            )
+        self.h5_files = [str(path) for path in valid_files]
 
         self.use_calo = use_calo
 
@@ -412,8 +440,25 @@ class FlatMomentumDataset(Dataset):
         for file_idx, h5_file in enumerate(self.h5_files):
             with h5py.File(h5_file, "r") as f:
                 n = int(f.attrs.get("n_tracks", len(f["offsets"]) - 1))
-                for ti in range(n):
-                    self.track_index.append((file_idx, ti))
+                if require_calo:
+                    if "calo_matched" not in f:
+                        raise RuntimeError(
+                            f"--require-calo requested but flat file {h5_file} "
+                            "has no 'calo_matched' dataset. Re-run "
+                            "preprocess_to_flat.py to regenerate it."
+                        )
+                    matched = np.asarray(f["calo_matched"][:], dtype=bool)
+                    if matched.shape != (n,):
+                        raise RuntimeError(
+                            f"Invalid calo_matched shape in {h5_file}: "
+                            f"expected ({n},), got {matched.shape}."
+                        )
+                    track_indices = np.flatnonzero(matched)
+                else:
+                    track_indices = range(n)
+
+                for ti in track_indices:
+                    self.track_index.append((file_idx, int(ti)))
                     if max_tracks and len(self.track_index) >= max_tracks:
                         break
             if max_tracks and len(self.track_index) >= max_tracks:
@@ -509,8 +554,15 @@ def create_dataloaders(
     if flat_format:
         if momentum_like:
             use_calo = kwargs.get("use_calo", False)
-            train_dataset = FlatMomentumDataset(train_data_path, max_tracks, use_calo=use_calo)
-            val_dataset   = FlatMomentumDataset(val_data_path,   max_tracks, use_calo=use_calo)
+            require_calo = kwargs.get("require_calo", False)
+            train_dataset = FlatMomentumDataset(
+                train_data_path, max_tracks, use_calo=use_calo,
+                require_calo=require_calo,
+            )
+            val_dataset = FlatMomentumDataset(
+                val_data_path, max_tracks, use_calo=use_calo,
+                require_calo=require_calo,
+            )
         else:
             train_dataset = FlatHDF5Dataset(train_data_path, max_tracks)
             val_dataset   = FlatHDF5Dataset(val_data_path,   max_tracks)
@@ -892,8 +944,25 @@ def validate(
     return total_loss / num_batches
 
 
+def _read_config_arguments(config_path: str) -> List[str]:
+    """Read shell-style arguments from a config file, allowing ``#`` comments."""
+    try:
+        with Path(config_path).open("r", encoding="utf-8") as config_file:
+            return shlex.split(config_file.read(), comments=True, posix=True)
+    except OSError as exc:
+        raise ValueError(f"Could not read config file {config_path!r}: {exc}") from exc
+    except ValueError as exc:
+        raise ValueError(f"Could not parse config file {config_path!r}: {exc}") from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a sparse track transformer model.")
+    parser.add_argument(
+        "-f", "--file", dest="config_file", metavar="CONFIG",
+        help="Read command-line arguments from CONFIG.  The file uses shell-style "
+             "quoting and supports # comments; explicit command-line arguments "
+             "override arguments from the file.",
+    )
     parser.add_argument("train_data", help="Path to training HDF5 file or directory.")
     parser.add_argument("val_data", help="Path to validation HDF5 file or directory.")
     parser.add_argument("--output-dir", default="./runs")
@@ -958,6 +1027,12 @@ def main() -> None:
     parser.add_argument("--compile", action="store_true", default=False)
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument("--flat-format", action="store_true", default=False)
+    parser.add_argument("--require-calo", action="store_true", default=False,
+                        help="Keep only tracks associated with a calorimeter "
+                             "cluster, using the flat-file calo_matched field. "
+                             "This filters samples only; it does not enable "
+                             "calorimeter input features. Requires --flat-format "
+                             "and a momentum model type.")
     parser.add_argument("--use-calo", action="store_true", default=False,
                         help="Feed per-crystal calorimeter hits (edep, time; "
                              "crystal_id via positional encoding) as extra "
@@ -987,7 +1062,29 @@ def main() -> None:
                              "(the run will still make progress, but the "
                              "first epoch after resume may spike briefly).")
 
-    args = parser.parse_args()
+    # Parse the config selector first, then feed its arguments to the normal
+    # parser.  Appending the remaining CLI arguments gives them the usual
+    # argparse last-occurrence precedence over config-file values.
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("-f", "--file", dest="config_file")
+    config_selector, remaining_argv = config_parser.parse_known_args()
+    config_argv: List[str] = []
+    if config_selector.config_file:
+        try:
+            config_argv = _read_config_arguments(config_selector.config_file)
+        except ValueError as exc:
+            parser.error(str(exc))
+    args = parser.parse_args([*config_argv, *remaining_argv])
+    args.config_file = config_selector.config_file
+
+    momentum_types = ("momentum", "abs_momentum", "cvn_momentum")
+    if args.require_calo and (
+        not args.flat_format or args.model_type not in momentum_types
+    ):
+        parser.error(
+            "--require-calo requires --flat-format and --model-type in "
+            "{momentum, abs_momentum, cvn_momentum}"
+        )
 
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
@@ -995,7 +1092,8 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    logger = setup_logging(output_dir / "logs")
+    command = shlex.join(getattr(sys, "orig_argv", [sys.executable, *sys.argv]))
+    logger = setup_logging(output_dir / "logs", command)
 
     logger.info(f"Device: {device}")
 
@@ -1086,8 +1184,14 @@ def main() -> None:
         train_data_resolved, val_data_resolved, channel_index,
         batch_size=args.batch_size, num_workers=args.num_workers, task=args.model_type,
         max_tracks=args.max_tracks, output_dir=str(output_dir), flat_format=args.flat_format,
-        use_calo=use_calo,
+        use_calo=use_calo, require_calo=args.require_calo,
     )
+    if args.require_calo:
+        logger.info(
+            "--require-calo enabled: retaining only tracks with "
+            "calo_matched=True; calorimeter input features remain controlled "
+            "independently by --use-calo."
+        )
     logger.info(f"Train tracks: {len(train_loader.dataset):,} | Val tracks: {len(val_loader.dataset):,}")
     logger.info(f"Train batches/epoch: {len(train_loader):,} | Val batches: {len(val_loader):,}")
 
@@ -1156,6 +1260,7 @@ def main() -> None:
         "steps_per_epoch": args.steps_per_epoch,
         "accumulation_steps": args.accumulation_steps,
         "batch_size": args.batch_size,
+        "require_calo": args.require_calo,
         "min_lr": 1e-6,
         "warmup_start_factor": 0.1,
     }
@@ -1203,9 +1308,16 @@ def main() -> None:
             )
         else:
             mismatches = {
-                key: (saved_training_config.get(key), value)
+                key: (
+                    saved_training_config.get(
+                        key, False if key == "require_calo" else None
+                    ),
+                    value,
+                )
                 for key, value in training_config.items()
-                if saved_training_config.get(key) != value
+                if saved_training_config.get(
+                    key, False if key == "require_calo" else None
+                ) != value
             }
             if mismatches:
                 message = "; ".join(

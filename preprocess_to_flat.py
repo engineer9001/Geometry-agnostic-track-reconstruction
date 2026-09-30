@@ -33,6 +33,11 @@ MAX_CRYSTALS = 20
 # only ping a single station.
 DEFAULT_MIN_HITS     = 5
 DEFAULT_MIN_STATIONS = 2
+DEFAULT_FILES_PER_WORKER = 25
+
+# Initialized once in each worker process. Keeping this 41,472-entry mapping
+# out of every submitted task prevents a large pickle/backlog for long runs.
+_WORKER_CHANNEL_INDEX: Optional[Dict[str, int]] = None
 
 # Channel-index → (plane, station) helpers.  Match build_standard_channel_index:
 #   idx = plane * (6*2*96) + panel * (2*96) + layer * 96 + straw
@@ -55,6 +60,12 @@ def build_standard_channel_index() -> Dict[str, int]:
             [(p, pa, l, s) for p in range(36) for pa in range(6) for l in range(2) for s in range(96)]
         )
     }
+
+
+def _init_worker() -> None:
+    """Create process-local state once, rather than serializing it per task."""
+    global _WORKER_CHANNEL_INDEX
+    _WORKER_CHANNEL_INDEX = build_standard_channel_index()
 
 
 def _write_flat_h5(
@@ -123,8 +134,11 @@ def _process_single_file(
     that has any nan/inf in its momentum target is also dropped (only when
     has_momentum=True), since it cannot supply a regression label.
     """
-    (src_path, out_path, channel_index, feature_names, has_momentum,
-     calo_scalar_cols, max_crystals, min_hits, min_stations) = args_tuple
+    (src_path, out_path, feature_names, has_momentum, calo_scalar_cols,
+     max_crystals, min_hits, min_stations) = args_tuple
+    if _WORKER_CHANNEL_INDEX is None:
+        raise RuntimeError("Worker channel index was not initialized")
+    channel_index = _WORKER_CHANNEL_INDEX
 
     all_features:       List[np.ndarray] = []
     all_indices:        List[np.ndarray] = []
@@ -279,8 +293,16 @@ def convert_directory(
     max_crystals: int = MAX_CRYSTALS,
     min_hits: int = DEFAULT_MIN_HITS,
     min_stations: int = DEFAULT_MIN_STATIONS,
+    overwrite: bool = False,
+    files_per_worker: int = DEFAULT_FILES_PER_WORKER,
 ) -> None:
     """Convert all .h5 files in input_dir to flat CSR format in output_dir.
+
+    By default, an input is skipped when ``output_dir`` already contains an
+    output file with the same basename. Set ``overwrite=True`` to reprocess
+    every input and replace existing outputs. Work is processed in bounded
+    batches; worker processes are restarted after ``files_per_worker`` files
+    each, releasing process-local HDF5 and allocator memory between batches.
 
     Tracks failing the quality cuts (``min_hits`` hits with a valid channel
     index AND ``min_stations`` distinct stations, plus finite momentum when
@@ -290,21 +312,46 @@ def convert_directory(
     if not input_files:
         raise FileNotFoundError(f"No .h5 files found in {input_dir}")
 
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    if files_per_worker < 1:
+        raise ValueError("files_per_worker must be at least 1")
+
     os.makedirs(output_dir, exist_ok=True)
-    channel_index = build_standard_channel_index()
 
     logger.info(f"Converting {len(input_files)} files: {input_dir} → {output_dir}")
     logger.info(f"Workers: {workers} | Features: {feature_names} | Momentum: {has_momentum}")
     logger.info(f"Quality cuts: min_hits={min_hits}, min_stations={min_stations}"
                 + (", finite momentum required" if has_momentum else ""))
 
-    # Build work items including the target out_path
+    # Build work items including the target out_path. Existing outputs are
+    # considered complete unless --overwrite was requested explicitly.
     work_items = []
+    skipped_existing = 0
     for src in input_files:
         out_name = os.path.basename(src)
         out_path = os.path.join(output_dir, out_name)
-        work_items.append((src, out_path, channel_index, feature_names, has_momentum,
+        if not overwrite and os.path.isfile(out_path):
+            skipped_existing += 1
+            continue
+        work_items.append((src, out_path, feature_names, has_momentum,
                            CALO_SCALAR_COLS, max_crystals, min_hits, min_stations))
+
+    if skipped_existing:
+        logger.info(
+            f"Skipping {skipped_existing:,} input file(s) with existing outputs. "
+            "Pass --overwrite to regenerate them."
+        )
+    if not work_items:
+        logger.info("All input files already have outputs; nothing to convert.")
+        return
+
+    batch_size = workers * files_per_worker
+    n_batches = (len(work_items) + batch_size - 1) // batch_size
+    logger.info(
+        f"Submitting {len(work_items):,} file(s) in {n_batches:,} batch(es) of at most "
+        f"{batch_size:,}; workers restart after each batch."
+    )
 
     total_tracks = 0
     total_hits = 0
@@ -312,25 +359,33 @@ def convert_directory(
     total_matched = 0
     total_rejected = 0
 
-    # Execute and monitor
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {
-            executor.submit(_process_single_file, item): item[0]
-            for item in work_items
-        }
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Converting"):
-            src_path = futures[future]
-            try:
-                # Unpack the small, lightweight tuple
-                _, n_tracks, n_hits, n_skipped, n_matched, n_rejected = future.result()
+    # A fresh executor per bounded batch ensures completed-file arrays and any
+    # HDF5/allocator high-water memory are released when its workers exit.
+    for batch_start in range(0, len(work_items), batch_size):
+        batch = work_items[batch_start:batch_start + batch_size]
+        batch_number = batch_start // batch_size + 1
+        logger.info(f"Starting batch {batch_number:,}/{n_batches:,} ({len(batch):,} file(s)).")
+        with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker) as executor:
+            futures = {
+                executor.submit(_process_single_file, item): item[0]
+                for item in batch
+            }
+            for future in tqdm(
+                as_completed(futures), total=len(futures),
+                desc=f"Converting batch {batch_number}/{n_batches}",
+            ):
+                src_path = futures.pop(future)
+                try:
+                    # Workers return only lightweight scalar metrics.
+                    _, n_tracks, n_hits, n_skipped, n_matched, n_rejected = future.result()
 
-                total_tracks += n_tracks
-                total_hits += n_hits
-                total_skipped += n_skipped
-                total_matched += n_matched
-                total_rejected += n_rejected
-            except Exception as e:
-                logger.error(f"Failed to convert {src_path}: {e}", exc_info=True)
+                    total_tracks += n_tracks
+                    total_hits += n_hits
+                    total_skipped += n_skipped
+                    total_matched += n_matched
+                    total_rejected += n_rejected
+                except Exception as e:
+                    logger.error(f"Failed to convert {src_path}: {e}", exc_info=True)
 
     total_seen = total_tracks + total_rejected
     logger.info(
@@ -364,6 +419,17 @@ def main() -> None:
         help="Number of parallel worker processes",
     )
     parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Regenerate outputs even when a same-named .h5 file already exists in output_dir.",
+    )
+    parser.add_argument(
+        "--files-per-worker", type=int, default=DEFAULT_FILES_PER_WORKER,
+        help=(
+            "Restart workers after this many files each to release HDF5 and allocator "
+            f"memory (default: {DEFAULT_FILES_PER_WORKER})."
+        ),
+    )
+    parser.add_argument(
         "--max-crystals", type=int, default=MAX_CRYSTALS,
         help=f"Fixed size of the per-track calo crystal block (default: {MAX_CRYSTALS}).",
     )
@@ -386,6 +452,8 @@ def main() -> None:
         max_crystals=args.max_crystals,
         min_hits=args.min_hits,
         min_stations=args.min_stations,
+        overwrite=args.overwrite,
+        files_per_worker=args.files_per_worker,
     )
 
 
