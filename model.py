@@ -371,6 +371,45 @@ class AbsMomentumPredictionHead(nn.Module):
         return self.mlp(pooled)
 
 
+class BinaryClassificationHead(nn.Module):
+    """Masked-pool track tokens and emit one raw Ce-vs-DIO logit per track."""
+
+    def __init__(
+        self,
+        d_model: int,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
+        pooling_type: str = "mean",
+    ):
+        super().__init__()
+        self.pooling_type = pooling_type
+        if pooling_type == "attention":
+            self.attention_pooling = nn.MultiheadAttention(
+                d_model, num_heads=1, batch_first=True, dropout=dropout
+            )
+            self.query_token = nn.Parameter(torch.randn(1, 1, d_model))
+        else:
+            self.attention_pooling = None
+            self.query_token = None
+
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, dim_feedforward // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward // 2, 1),
+        )
+
+    def forward(self, encoded: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        pooled = _pool(
+            encoded, mask, self.pooling_type,
+            self.attention_pooling, self.query_token,
+        )
+        return self.mlp(pooled).squeeze(-1)
+
+
 class MomentumPredictionHead(nn.Module):
     """
     Pools the transformer output and predicts a 3D momentum vector.
@@ -853,7 +892,7 @@ class TrackReconstructionModel(nn.Module):
         # The CvN variant swaps only the straw-token embedding stage for a
         # geometry-aware neighbor conv; everything downstream (PE, detector
         # type embedding, transformer stack, heads) is identical.
-        if task == "cvn_momentum":
+        if task in ("cvn_momentum", "cvn_classifier"):
             self.encoder = CvnMaskedTransformerEncoder(
                 input_dim=input_dim,
                 d_model=d_model,
@@ -898,6 +937,13 @@ class TrackReconstructionModel(nn.Module):
                 dropout=dropout,
                 pooling_type=pooling_type,
             )
+        elif task == "cvn_classifier":
+            self.head = BinaryClassificationHead(
+                d_model,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                pooling_type=pooling_type,
+            )
         elif task == "regression":
             self.head = nn.Sequential(
                 nn.Linear(d_model, dim_feedforward),
@@ -928,7 +974,7 @@ class TrackReconstructionModel(nn.Module):
             crystal_ch=crystal_ch,
         )
 
-        if self.task in ("momentum", "abs_momentum", "cvn_momentum"):
+        if self.task in ("momentum", "abs_momentum", "cvn_momentum", "cvn_classifier"):
             return self.head(encoded, mask=combined_mask)
         return self.head(encoded)
 

@@ -497,6 +497,97 @@ class FlatMomentumDataset(Dataset):
                 crystal_feats, crystal_ids, n_crys)
 
 
+def infer_binary_label_from_filename(path: str) -> int:
+    """Infer the track class from an HDF5 basename (Ce=1, DIO=0)."""
+    name = Path(path).name
+    is_ce = "CeEndpointOnSpill" in name
+    is_dio = "DIOtail95OnSpill" in name
+    if is_ce == is_dio:
+        raise ValueError(
+            f"Cannot infer a unique Ce-vs-DIO label from filename {name!r}; "
+            "expected exactly one of 'CeEndpointOnSpill' or 'DIOtail95OnSpill'."
+        )
+    return int(is_ce)
+
+
+class FlatClassifierDataset(FlatHDF5Dataset):
+    """Flat CSR tracks labeled strictly from each source HDF5 filename."""
+
+    def __init__(
+        self,
+        data_path: str,
+        max_tracks: Optional[int] = None,
+        require_calo: bool = False,
+    ):
+        p = Path(data_path)
+        candidates = sorted(p.glob("*.h5")) if p.is_dir() else [p]
+        if not candidates or any(not path.is_file() for path in candidates):
+            raise FileNotFoundError(f"No HDF5 files found at {data_path}")
+
+        empty = [path for path in candidates if path.stat().st_size == 0]
+        if empty:
+            logging.getLogger(__name__).warning(
+                "Skipping %d zero-byte HDF5 file(s) under %s; first: %s",
+                len(empty),
+                data_path,
+                empty[0],
+            )
+            candidates = [path for path in candidates if path.stat().st_size > 0]
+        if not candidates:
+            raise RuntimeError(f"No non-empty HDF5 files found at {data_path}")
+
+        invalid = [path for path in candidates if not h5py.is_hdf5(path)]
+        if invalid:
+            raise RuntimeError(f"Classifier input contains invalid HDF5 file: {invalid[0]}")
+
+        self.h5_files = [str(path) for path in candidates]
+        self.file_labels = [infer_binary_label_from_filename(path) for path in self.h5_files]
+        self.track_index: List[Tuple[int, int]] = []
+        self.class_counts = {0: 0, 1: 0}
+
+        for file_idx, h5_file in enumerate(self.h5_files):
+            with h5py.File(h5_file, "r") as f:
+                if not {"offsets", "features", "ch_indices"}.issubset(f.keys()):
+                    raise RuntimeError(f"File is not flat CSR HDF5: {h5_file}")
+                n = int(f.attrs.get("n_tracks", len(f["offsets"]) - 1))
+                if require_calo:
+                    if "calo_matched" not in f:
+                        raise RuntimeError(
+                            f"--require-calo requested but {h5_file} has no calo_matched dataset."
+                        )
+                    matched = np.asarray(f["calo_matched"][:], dtype=bool)
+                    if matched.shape != (n,):
+                        raise RuntimeError(
+                            f"Invalid calo_matched shape in {h5_file}: expected ({n},), "
+                            f"got {matched.shape}."
+                        )
+                    track_indices = np.flatnonzero(matched)
+                else:
+                    track_indices = range(n)
+
+                label = self.file_labels[file_idx]
+                for track_idx in track_indices:
+                    self.track_index.append((file_idx, int(track_idx)))
+                    self.class_counts[label] += 1
+                    if max_tracks and len(self.track_index) >= max_tracks:
+                        break
+            if max_tracks and len(self.track_index) >= max_tracks:
+                break
+
+        if not self.track_index:
+            raise RuntimeError(f"No classifier tracks selected from {data_path}")
+
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
+        file_idx, track_idx = self.track_index[idx]
+        f = _get_h5_handle(self.h5_files[file_idx])
+        start = int(f["offsets"][track_idx])
+        stop = int(f["offsets"][track_idx + 1])
+        features = np.asarray(f["features"][start:stop], dtype=np.float32)
+        channels = np.asarray(f["ch_indices"][start:stop], dtype=np.int64)
+        label = torch.tensor(float(self.file_labels[file_idx]), dtype=torch.float32)
+        return features, channels, label
+
+
 class MultiFileMomentumDataset(Dataset):
     """PyTorch Dataset for 3D momentum prediction from multiple HDF5 files."""
 
@@ -550,9 +641,21 @@ def create_dataloaders(
     """Create train and validation dataloaders."""
 
     momentum_like = task in ("momentum", "abs_momentum", "cvn_momentum")
+    classifier = task == "cvn_classifier"
+
+    if classifier and not flat_format:
+        raise ValueError("cvn_classifier requires --flat-format")
 
     if flat_format:
-        if momentum_like:
+        if classifier:
+            require_calo = kwargs.get("require_calo", False)
+            train_dataset = FlatClassifierDataset(
+                train_data_path, max_tracks, require_calo=require_calo,
+            )
+            val_dataset = FlatClassifierDataset(
+                val_data_path, max_tracks, require_calo=require_calo,
+            )
+        elif momentum_like:
             use_calo = kwargs.get("use_calo", False)
             require_calo = kwargs.get("require_calo", False)
             train_dataset = FlatMomentumDataset(
@@ -721,14 +824,17 @@ def train_epoch(
     amp_device = device.type
 
     pbar = tqdm(dataloader, desc="Training", total=steps_per_epoch)
-    momentum_like = task in ("momentum", "abs_momentum", "cvn_momentum")
+    supervised_track = task in ("momentum", "abs_momentum", "cvn_momentum", "cvn_classifier")
+    classifier = task == "cvn_classifier"
+    correct = 0
+    n_examples = 0
     logger = logging.getLogger(__name__)
     nan_batches = 0
     batches_seen = 0  # counts EVERY batch we tried, including skips
     for batch_idx, batch_data in enumerate(pbar):
         if steps_per_epoch is not None and batch_idx >= steps_per_epoch:
             break
-        if momentum_like:
+        if supervised_track:
             (x, mask, ch, target,
              crystal_x, crystal_ch, crystal_mask) = _unpack_momentum_batch(batch_data, device)
             with autocast(amp_device, enabled=use_amp):
@@ -868,7 +974,12 @@ def train_epoch(
 
         total_loss += loss.item() * accumulation_steps
         num_batches += 1
-        pbar.set_postfix({"loss": f"{total_loss / num_batches:.4f}"})
+        postfix = {"loss": f"{total_loss / num_batches:.4f}"}
+        if classifier:
+            correct += int(((output.detach() >= 0) == (target >= 0.5)).sum().item())
+            n_examples += int(target.numel())
+            postfix["acc"] = f"{correct / max(n_examples, 1):.4f}"
+        pbar.set_postfix(postfix)
 
         # ------------------------------------------------------------
         # Weight/grad magnitude probe.  A run entering the pathological
@@ -896,7 +1007,8 @@ def train_epoch(
             f"loss or gradients."
         )
 
-    return total_loss / max(num_batches, 1)
+    mean_loss = total_loss / max(num_batches, 1)
+    return (mean_loss, correct / max(n_examples, 1)) if classifier else mean_loss
 
 
 def validate(
@@ -913,11 +1025,14 @@ def validate(
     use_amp = device.type == "cuda"
     amp_device = device.type
 
-    momentum_like = task in ("momentum", "abs_momentum", "cvn_momentum")
+    supervised_track = task in ("momentum", "abs_momentum", "cvn_momentum", "cvn_classifier")
+    classifier = task == "cvn_classifier"
+    correct = 0
+    n_examples = 0
     with torch.no_grad():
         pbar = tqdm(dataloader, desc="Validation")
         for batch_data in pbar:
-            if momentum_like:
+            if supervised_track:
                 (x, mask, ch, target,
                  crystal_x, crystal_ch, crystal_mask) = _unpack_momentum_batch(batch_data, device)
                 with autocast(amp_device, enabled=use_amp):
@@ -939,9 +1054,15 @@ def validate(
 
             total_loss += loss.item()
             num_batches += 1
-            pbar.set_postfix({"loss": f"{total_loss / num_batches:.4f}"})
+            postfix = {"loss": f"{total_loss / num_batches:.4f}"}
+            if classifier:
+                correct += int(((output >= 0) == (target >= 0.5)).sum().item())
+                n_examples += int(target.numel())
+                postfix["acc"] = f"{correct / max(n_examples, 1):.4f}"
+            pbar.set_postfix(postfix)
 
-    return total_loss / num_batches
+    mean_loss = total_loss / max(num_batches, 1)
+    return (mean_loss, correct / max(n_examples, 1)) if classifier else mean_loss
 
 
 def _read_config_arguments(config_path: str) -> List[str]:
@@ -1007,14 +1128,15 @@ def main() -> None:
     parser.add_argument("--max-channels", type=int, default=50000)
     parser.add_argument(
         "--model-type",
-        choices=["reconstruction", "denoising", "momentum", "abs_momentum", "cvn_momentum"],
+        choices=["reconstruction", "denoising", "momentum", "abs_momentum", "cvn_momentum", "cvn_classifier"],
         default="reconstruction",
         help="Task head to train. 'momentum' predicts (px, py, pz); "
              "'abs_momentum' predicts (pT, |pz|) to break the forward/backward "
              "magnetic-mirror degeneracy in the CE isotropic MC; "
              "'cvn_momentum' uses a geometry-aware convolutional-neighbor "
-             "stem in front of the transformer and predicts (pT, |pz|) "
-             "(same degeneracy-safe target as abs_momentum).",
+             "stem in front of the transformer and predicts (pT, |pz|); "
+             "'cvn_classifier' uses that encoder to classify Ce (1) vs DIO (0) "
+             "from flat-file source names.",
     )
     parser.add_argument("--loss-fn", choices=["mse", "l1"], default="mse")
     parser.add_argument("--accumulation-steps", type=int, default=1)
@@ -1025,6 +1147,11 @@ def main() -> None:
     parser.add_argument("--pooling-type", choices=["mean", "max", "attention"], default="mean")
     parser.add_argument("--max-tracks", type=int, default=None)
     parser.add_argument("--compile", action="store_true", default=False)
+    parser.add_argument(
+        "--init-encoder-from", default=None, metavar="CHECKPOINT",
+        help="For cvn_classifier only, initialize compatible encoder weights "
+             "from a cvn_momentum checkpoint while keeping a fresh classifier head.",
+    )
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument("--flat-format", action="store_true", default=False)
     parser.add_argument("--require-calo", action="store_true", default=False,
@@ -1032,7 +1159,7 @@ def main() -> None:
                              "cluster, using the flat-file calo_matched field. "
                              "This filters samples only; it does not enable "
                              "calorimeter input features. Requires --flat-format "
-                             "and a momentum model type.")
+                             "and a supervised track model type.")
     parser.add_argument("--use-calo", action="store_true", default=False,
                         help="Feed per-crystal calorimeter hits (edep, time; "
                              "crystal_id via positional encoding) as extra "
@@ -1077,14 +1204,20 @@ def main() -> None:
     args = parser.parse_args([*config_argv, *remaining_argv])
     args.config_file = config_selector.config_file
 
-    momentum_types = ("momentum", "abs_momentum", "cvn_momentum")
+    supervised_types = ("momentum", "abs_momentum", "cvn_momentum", "cvn_classifier")
     if args.require_calo and (
-        not args.flat_format or args.model_type not in momentum_types
+        not args.flat_format or args.model_type not in supervised_types
     ):
         parser.error(
             "--require-calo requires --flat-format and --model-type in "
-            "{momentum, abs_momentum, cvn_momentum}"
+            "{momentum, abs_momentum, cvn_momentum, cvn_classifier}"
         )
+    if args.model_type == "cvn_classifier" and not args.flat_format:
+        parser.error("--model-type cvn_classifier requires --flat-format")
+    if args.init_encoder_from and args.model_type != "cvn_classifier":
+        parser.error("--init-encoder-from is only valid with --model-type cvn_classifier")
+    if args.init_encoder_from and args.resume:
+        parser.error("--init-encoder-from and --resume are mutually exclusive")
 
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
@@ -1193,6 +1326,27 @@ def main() -> None:
             "independently by --use-calo."
         )
     logger.info(f"Train tracks: {len(train_loader.dataset):,} | Val tracks: {len(val_loader.dataset):,}")
+    class_counts: Optional[Dict[str, Dict[str, int]]] = None
+    pos_weight_value: Optional[float] = None
+    if args.model_type == "cvn_classifier":
+        train_counts = train_loader.dataset.class_counts
+        val_counts = val_loader.dataset.class_counts
+        if min(train_counts.values()) == 0 or min(val_counts.values()) == 0:
+            raise RuntimeError(
+                "cvn_classifier requires both Ce and DIO tracks in training and validation; "
+                f"got train={train_counts}, validation={val_counts}. "
+                "Check filenames and avoid a class-truncating --max-tracks value."
+            )
+        pos_weight_value = train_counts[0] / train_counts[1]
+        class_counts = {
+            "train": {"dio": train_counts[0], "ce": train_counts[1]},
+            "validation": {"dio": val_counts[0], "ce": val_counts[1]},
+        }
+        logger.info(
+            f"Classifier classes | train: Ce={train_counts[1]:,}, DIO={train_counts[0]:,} | "
+            f"validation: Ce={val_counts[1]:,}, DIO={val_counts[0]:,} | "
+            f"BCE pos_weight={pos_weight_value:.6g}"
+        )
     logger.info(f"Train batches/epoch: {len(train_loader):,} | Val batches: {len(val_loader):,}")
 
     # ------------------------------------------------------------------
@@ -1239,6 +1393,35 @@ def main() -> None:
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
+    if args.init_encoder_from:
+        init_path = Path(args.init_encoder_from)
+        if not init_path.is_file():
+            raise FileNotFoundError(f"--init-encoder-from checkpoint not found: {init_path}")
+        init_ckpt = torch.load(init_path, map_location="cpu", weights_only=False)
+        init_config = init_ckpt.get("config", {})
+        if init_config.get("task") != "cvn_momentum":
+            raise ValueError(
+                f"--init-encoder-from expected a cvn_momentum checkpoint, got "
+                f"task={init_config.get('task')!r} in {init_path}"
+            )
+        for key in ("input_dim", "d_model", "nhead", "num_layers", "max_channels"):
+            if init_config.get(key) != config.to_dict().get(key):
+                raise ValueError(
+                    f"--init-encoder-from architecture mismatch for {key}: "
+                    f"checkpoint={init_config.get(key)!r}, classifier={config.to_dict().get(key)!r}"
+                )
+        source_state = {
+            key.removeprefix("_orig_mod."): value
+            for key, value in init_ckpt["model_state_dict"].items()
+        }
+        encoder_state = {
+            key.removeprefix("encoder."): value
+            for key, value in source_state.items()
+            if key.startswith("encoder.")
+        }
+        model.encoder.load_state_dict(encoder_state, strict=True)
+        logger.info(f"Initialized classifier encoder from {init_path}; classifier head is fresh.")
+
     model.to(device)
 
     if args.compile:
@@ -1261,6 +1444,8 @@ def main() -> None:
         "accumulation_steps": args.accumulation_steps,
         "batch_size": args.batch_size,
         "require_calo": args.require_calo,
+        "class_counts": class_counts,
+        "pos_weight": pos_weight_value,
         "min_lr": 1e-6,
         "warmup_start_factor": 0.1,
     }
@@ -1365,7 +1550,7 @@ def main() -> None:
                     resume_history = json.load(f)
                 # Trim to at most resume_epoch entries (checkpoint was
                 # saved AFTER that epoch's val_loss was appended).
-                for k in ("train_loss", "val_loss"):
+                for k in ("train_loss", "val_loss", "train_accuracy", "val_accuracy"):
                     if k in resume_history:
                         resume_history[k] = resume_history[k][:resume_epoch]
             except Exception as e:  # noqa: BLE001
@@ -1404,6 +1589,8 @@ def main() -> None:
     best_val_loss = float("inf")
     patience, patience_counter = 15, 0
     history = {"train_loss": [], "val_loss": []}
+    if args.model_type == "cvn_classifier":
+        history.update({"train_accuracy": [], "val_accuracy": []})
     rolling_ckpts: List[Path] = []  # FIFO of last-N per-epoch checkpoints
     divergence_frac = args.divergence_frac if args.divergence_frac > 0 else None
 
@@ -1450,6 +1637,10 @@ def main() -> None:
 
     if args.model_type == "momentum":
         loss_fn = momentum_loss
+    elif args.model_type == "cvn_classifier":
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
+        )
     elif args.model_type in ("abs_momentum", "cvn_momentum"):
         # cvn_momentum uses the same (pT, |pz|) target as abs_momentum so
         # it never has to fit through the forward/backward or φ-rotational
@@ -1480,7 +1671,7 @@ def main() -> None:
             set_lr(global_step)
 
         try:
-            train_loss = train_epoch(
+            train_result = train_epoch(
                 model, train_loader, optimizer, device, scaler,
                 loss_fn=loss_fn, accumulation_steps=args.accumulation_steps,
                 task=args.model_type, epoch_number=epoch + 1,
@@ -1489,6 +1680,10 @@ def main() -> None:
                 grad_clip=args.grad_clip if args.grad_clip > 0 else None,
                 divergence_frac=divergence_frac,
             )
+            if args.model_type == "cvn_classifier":
+                train_loss, train_accuracy = train_result
+            else:
+                train_loss = train_result
         except DivergenceError as exc:
             logger.error(
                 f"Training aborted at epoch {epoch + 1}: {exc}  "
@@ -1502,15 +1697,28 @@ def main() -> None:
             with open(output_dir / "history.json", "w") as f:
                 json.dump(history, f, indent=2)
             return
-        val_loss = validate(model, val_loader, device, loss_fn=loss_fn, task=args.model_type)
+        val_result = validate(model, val_loader, device, loss_fn=loss_fn, task=args.model_type)
+        if args.model_type == "cvn_classifier":
+            val_loss, val_accuracy = val_result
+        else:
+            val_loss = val_result
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        if args.model_type == "cvn_classifier":
+            history["train_accuracy"].append(train_accuracy)
+            history["val_accuracy"].append(val_accuracy)
 
         current_lr = optimizer.param_groups[0]["lr"]
+        metric_text = ""
+        if args.model_type == "cvn_classifier":
+            metric_text = (
+                f" | Train Accuracy: {train_accuracy:.4f} | "
+                f"Val Accuracy: {val_accuracy:.4f}"
+            )
         logger.info(
-            f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"LR: {current_lr:.2e} | step: {global_step:,}"
+            f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}"
+            f"{metric_text} | LR: {current_lr:.2e} | step: {global_step:,}"
         )
 
         val_diverged = (
@@ -1534,6 +1742,14 @@ def main() -> None:
                     "model_state_dict": model.state_dict(),
                     "config": config.to_dict(),
                     "training_config": training_config,
+                    "epoch": epoch + 1,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "train_accuracy": train_accuracy if args.model_type == "cvn_classifier" else None,
+                    "val_accuracy": val_accuracy if args.model_type == "cvn_classifier" else None,
+                    "class_counts": class_counts,
+                    "pos_weight": pos_weight_value,
+                    "init_encoder_from": args.init_encoder_from,
                 },
                 output_dir / "best_model.pt",
             )
@@ -1558,6 +1774,11 @@ def main() -> None:
                     "global_step": global_step,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
+                    "train_accuracy": train_accuracy if args.model_type == "cvn_classifier" else None,
+                    "val_accuracy": val_accuracy if args.model_type == "cvn_classifier" else None,
+                    "class_counts": class_counts,
+                    "pos_weight": pos_weight_value,
+                    "init_encoder_from": args.init_encoder_from,
                 },
                 ckpt_path,
             )
