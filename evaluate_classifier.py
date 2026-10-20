@@ -12,7 +12,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from model import TrackModelConfig, TrackReconstructionModel
-from train import FlatClassifierDataset, sparse_collate_fn
+from train import (
+    DEFAULT_TANDIP_MAX,
+    DEFAULT_TANDIP_MIN,
+    FlatClassifierDataset,
+    sparse_collate_fn,
+)
 
 
 def generate_predictions(
@@ -204,6 +209,10 @@ def main() -> None:
     parser.add_argument("--require-calo", action="store_true",
                         help="Evaluate only calo-matched tracks; does not use calo features.")
     parser.add_argument("--max-tracks", type=int, default=None)
+    parser.add_argument("--tandip-min", type=float, default=None,
+                        help="Inclusive signed lower bound (default: checkpoint setting).")
+    parser.add_argument("--tandip-max", type=float, default=None,
+                        help="Inclusive signed upper bound (default: checkpoint setting).")
     parser.add_argument("--no-predictions", action="store_true",
                         help="Do not save validation_predictions.npz.")
     args = parser.parse_args()
@@ -218,6 +227,14 @@ def main() -> None:
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config_dict = checkpoint["config"]
+    training_config = checkpoint.get("training_config", {})
+    tandip_min = (args.tandip_min if args.tandip_min is not None
+                  else training_config.get("tandip_min", DEFAULT_TANDIP_MIN))
+    tandip_max = (args.tandip_max if args.tandip_max is not None
+                  else training_config.get("tandip_max", DEFAULT_TANDIP_MAX))
+    if not (np.isfinite(tandip_min) and np.isfinite(tandip_max)
+            and tandip_min <= tandip_max):
+        parser.error("resolved tandip bounds must be finite with minimum <= maximum")
     if config_dict.get("task") != "cvn_classifier":
         raise ValueError(
             f"Expected cvn_classifier checkpoint, got task={config_dict.get('task')!r}"
@@ -233,6 +250,7 @@ def main() -> None:
     dataset = FlatClassifierDataset(
         args.validation_data, max_tracks=args.max_tracks,
         require_calo=args.require_calo,
+        tandip_min=tandip_min, tandip_max=tandip_max,
     )
     if min(dataset.class_counts.values()) == 0:
         raise RuntimeError(f"Evaluation requires both classes; got {dataset.class_counts}")

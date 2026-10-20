@@ -34,6 +34,47 @@ from model import (
 from nedt import build_sparse_track_from_hdf5_group, infer_channel_index_from_hdf5
 
 
+DEFAULT_TANDIP_MIN = 0.41
+DEFAULT_TANDIP_MAX = 1.2
+
+
+def _flat_tandip_mask(f: "h5py.File", n_tracks: int,
+                       tandip_min: float, tandip_max: float) -> np.ndarray:
+    """Return the inclusive signed-tandip selection for one flat HDF5 file."""
+    if "tandip" not in f:
+        raise RuntimeError(
+            f"Flat HDF5 file {f.filename} has no 'tandip' dataset; "
+            "regenerate it with the updated preprocess_to_flat.py."
+        )
+    tandip = np.asarray(f["tandip"][:], dtype=np.float64)
+    if tandip.shape != (n_tracks,):
+        raise RuntimeError(
+            f"Invalid tandip shape in {f.filename}: expected ({n_tracks},), "
+            f"got {tandip.shape}."
+        )
+    return np.isfinite(tandip) & (tandip >= tandip_min) & (tandip <= tandip_max)
+
+
+def _grouped_track_names(f: "h5py.File", h5_path: str,
+                         tandip_min: float, tandip_max: float,
+                         max_tracks: Optional[int]) -> List[str]:
+    """Select grouped tracks using inclusive signed-tandip bounds."""
+    selected: List[str] = []
+    for track_name in f["tracks"].keys():
+        group = f["tracks"][track_name]
+        if "tandip" not in group.attrs:
+            raise RuntimeError(
+                f"Track {track_name} in {h5_path} has no tandip attribute; "
+                "regenerate it with the updated extractor."
+            )
+        tandip = float(group.attrs["tandip"])
+        if np.isfinite(tandip) and tandip_min <= tandip <= tandip_max:
+            selected.append(track_name)
+            if max_tracks and len(selected) >= max_tracks:
+                break
+    return selected
+
+
 def setup_logging(log_dir: Path, command: str) -> logging.Logger:
     """Set up logging to file and console, recording the invocation first."""
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -183,12 +224,16 @@ def _build_track_index(
     h5_files: List[str],
     max_tracks: Optional[int],
     cache_path: Optional[str] = None,
+    tandip_min: float = DEFAULT_TANDIP_MIN,
+    tandip_max: float = DEFAULT_TANDIP_MAX,
 ) -> List[Tuple[int, str]]:
     """Scan HDF5 files to build a (file_idx, track_name) index (cached)."""
     if cache_path and os.path.exists(cache_path):
         with open(cache_path, "rb") as fh:
             cached = pickle.load(fh)
-        if cached.get("h5_files") == h5_files:
+        if (cached.get("h5_files") == h5_files
+                and cached.get("tandip_min") == tandip_min
+                and cached.get("tandip_max") == tandip_max):
             logging.getLogger(__name__).info(f"Loaded track index from cache: {cache_path}")
             return cached["track_index"]
 
@@ -199,18 +244,35 @@ def _build_track_index(
                 if "tracks" not in f:
                     continue
                 for track_name in f["tracks"].keys():
+                    track_group = f["tracks"][track_name]
+                    if "tandip" not in track_group.attrs:
+                        raise RuntimeError(
+                            f"Track {track_name} in {h5_file} has no tandip attribute; "
+                            "regenerate the HDF5 file with the updated extractor."
+                        )
+                    tandip = float(track_group.attrs["tandip"])
+                    if not (np.isfinite(tandip)
+                            and tandip_min <= tandip <= tandip_max):
+                        continue
                     track_index.append((file_idx, track_name))
                     if max_tracks and len(track_index) >= max_tracks:
                         break
             if max_tracks and len(track_index) >= max_tracks:
                 break
-        except Exception:
-            pass
+        except (OSError, KeyError) as exc:
+            logging.getLogger(__name__).warning(
+                "Skipping unreadable grouped HDF5 file %s: %s", h5_file, exc
+            )
 
     if cache_path:
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
         with open(cache_path, "wb") as fh:
-            pickle.dump({"h5_files": h5_files, "track_index": track_index}, fh)
+            pickle.dump({
+                "h5_files": h5_files,
+                "track_index": track_index,
+                "tandip_min": tandip_min,
+                "tandip_max": tandip_max,
+            }, fh)
         logging.getLogger(__name__).info(f"Saved track index cache: {cache_path}")
 
     return track_index
@@ -226,6 +288,8 @@ class MultiFileHDF5Dataset(Dataset):
         feature_names: Tuple[str, ...] = ("t0", "t1", "tot0", "tot1"),
         max_tracks: Optional[int] = None,
         index_cache_path: Optional[str] = None,
+        tandip_min: float = DEFAULT_TANDIP_MIN,
+        tandip_max: float = DEFAULT_TANDIP_MAX,
     ):
         self.logger = logging.getLogger(__name__)
         p = Path(data_path)
@@ -238,7 +302,9 @@ class MultiFileHDF5Dataset(Dataset):
 
         self.channel_index = channel_index
         self.feature_names = feature_names
-        self.track_index = _build_track_index(self.h5_files, max_tracks, index_cache_path)
+        self.track_index = _build_track_index(
+            self.h5_files, max_tracks, index_cache_path, tandip_min, tandip_max
+        )
 
     def __len__(self) -> int:
         return len(self.track_index)
@@ -260,15 +326,17 @@ class TrackHDF5Dataset(Dataset):
         channel_index: Dict[str, int],
         feature_names: Tuple[str, ...] = ("t0", "t1", "tot0", "tot1"),
         max_tracks: Optional[int] = None,
+        tandip_min: float = DEFAULT_TANDIP_MIN,
+        tandip_max: float = DEFAULT_TANDIP_MAX,
     ):
         self.h5_path = str(h5_path)
         self.channel_index = channel_index
         self.feature_names = feature_names
 
         with h5py.File(self.h5_path, "r") as f:
-            self.track_names = list(f["tracks"].keys())
-            if max_tracks:
-                self.track_names = self.track_names[:max_tracks]
+            self.track_names = _grouped_track_names(
+                f, self.h5_path, tandip_min, tandip_max, max_tracks
+            )
 
     def __len__(self) -> int:
         return len(self.track_names)
@@ -289,15 +357,17 @@ class MomentumTrackDataset(Dataset):
         channel_index: Dict[str, int],
         feature_names: Tuple[str, ...] = ("t0", "t1", "tot0", "tot1"),
         max_tracks: Optional[int] = None,
+        tandip_min: float = DEFAULT_TANDIP_MIN,
+        tandip_max: float = DEFAULT_TANDIP_MAX,
     ):
         self.h5_path = str(h5_path)
         self.channel_index = channel_index
         self.feature_names = feature_names
 
         with h5py.File(self.h5_path, "r") as f:
-            self.track_names = list(f["tracks"].keys())
-            if max_tracks:
-                self.track_names = self.track_names[:max_tracks]
+            self.track_names = _grouped_track_names(
+                f, self.h5_path, tandip_min, tandip_max, max_tracks
+            )
 
     def __len__(self) -> int:
         return len(self.track_names)
@@ -319,7 +389,9 @@ class FlatHDF5Dataset(Dataset):
     Dataset for the flat CSR-style HDF5 format produced by preprocess_to_flat.py.
     """
 
-    def __init__(self, data_path: str, max_tracks: Optional[int] = None):
+    def __init__(self, data_path: str, max_tracks: Optional[int] = None,
+                 tandip_min: float = DEFAULT_TANDIP_MIN,
+                 tandip_max: float = DEFAULT_TANDIP_MAX):
         p = Path(data_path)
         if p.is_dir():
             self.h5_files = [str(x) for x in sorted(p.glob("*.h5"))]
@@ -332,7 +404,10 @@ class FlatHDF5Dataset(Dataset):
         for file_idx, h5_file in enumerate(self.h5_files):
             with h5py.File(h5_file, "r") as f:
                 n = int(f.attrs.get("n_tracks", len(f["offsets"]) - 1))
-                for ti in range(n):
+                track_indices = np.flatnonzero(
+                    _flat_tandip_mask(f, n, tandip_min, tandip_max)
+                )
+                for ti in track_indices:
                     self.track_index.append((file_idx, ti))
                     if max_tracks and len(self.track_index) >= max_tracks:
                         break
@@ -391,6 +466,8 @@ class FlatMomentumDataset(Dataset):
         max_tracks: Optional[int] = None,
         use_calo: bool = False,
         require_calo: bool = False,
+        tandip_min: float = DEFAULT_TANDIP_MIN,
+        tandip_max: float = DEFAULT_TANDIP_MAX,
     ):
         p = Path(data_path)
         if p.is_dir():
@@ -440,6 +517,7 @@ class FlatMomentumDataset(Dataset):
         for file_idx, h5_file in enumerate(self.h5_files):
             with h5py.File(h5_file, "r") as f:
                 n = int(f.attrs.get("n_tracks", len(f["offsets"]) - 1))
+                selected = _flat_tandip_mask(f, n, tandip_min, tandip_max)
                 if require_calo:
                     if "calo_matched" not in f:
                         raise RuntimeError(
@@ -453,9 +531,8 @@ class FlatMomentumDataset(Dataset):
                             f"Invalid calo_matched shape in {h5_file}: "
                             f"expected ({n},), got {matched.shape}."
                         )
-                    track_indices = np.flatnonzero(matched)
-                else:
-                    track_indices = range(n)
+                    selected &= matched
+                track_indices = np.flatnonzero(selected)
 
                 for ti in track_indices:
                     self.track_index.append((file_idx, int(ti)))
@@ -518,6 +595,8 @@ class FlatClassifierDataset(FlatHDF5Dataset):
         data_path: str,
         max_tracks: Optional[int] = None,
         require_calo: bool = False,
+        tandip_min: float = DEFAULT_TANDIP_MIN,
+        tandip_max: float = DEFAULT_TANDIP_MAX,
     ):
         p = Path(data_path)
         candidates = sorted(p.glob("*.h5")) if p.is_dir() else [p]
@@ -550,6 +629,7 @@ class FlatClassifierDataset(FlatHDF5Dataset):
                 if not {"offsets", "features", "ch_indices"}.issubset(f.keys()):
                     raise RuntimeError(f"File is not flat CSR HDF5: {h5_file}")
                 n = int(f.attrs.get("n_tracks", len(f["offsets"]) - 1))
+                selected = _flat_tandip_mask(f, n, tandip_min, tandip_max)
                 if require_calo:
                     if "calo_matched" not in f:
                         raise RuntimeError(
@@ -561,9 +641,8 @@ class FlatClassifierDataset(FlatHDF5Dataset):
                             f"Invalid calo_matched shape in {h5_file}: expected ({n},), "
                             f"got {matched.shape}."
                         )
-                    track_indices = np.flatnonzero(matched)
-                else:
-                    track_indices = range(n)
+                    selected &= matched
+                track_indices = np.flatnonzero(selected)
 
                 label = self.file_labels[file_idx]
                 for track_idx in track_indices:
@@ -598,6 +677,8 @@ class MultiFileMomentumDataset(Dataset):
         feature_names: Tuple[str, ...] = ("t0", "t1", "tot0", "tot1"),
         max_tracks: Optional[int] = None,
         index_cache_path: Optional[str] = None,
+        tandip_min: float = DEFAULT_TANDIP_MIN,
+        tandip_max: float = DEFAULT_TANDIP_MAX,
     ):
         p = Path(data_path)
         if p.is_dir():
@@ -607,7 +688,9 @@ class MultiFileMomentumDataset(Dataset):
 
         self.channel_index = channel_index
         self.feature_names = feature_names
-        self.track_index = _build_track_index(self.h5_files, max_tracks, index_cache_path)
+        self.track_index = _build_track_index(
+            self.h5_files, max_tracks, index_cache_path, tandip_min, tandip_max
+        )
 
     def __len__(self) -> int:
         return len(self.track_index)
@@ -642,6 +725,8 @@ def create_dataloaders(
 
     momentum_like = task in ("momentum", "abs_momentum", "cvn_momentum")
     classifier = task == "cvn_classifier"
+    tandip_min = kwargs.get("tandip_min", DEFAULT_TANDIP_MIN)
+    tandip_max = kwargs.get("tandip_max", DEFAULT_TANDIP_MAX)
 
     if classifier and not flat_format:
         raise ValueError("cvn_classifier requires --flat-format")
@@ -651,9 +736,11 @@ def create_dataloaders(
             require_calo = kwargs.get("require_calo", False)
             train_dataset = FlatClassifierDataset(
                 train_data_path, max_tracks, require_calo=require_calo,
+                tandip_min=tandip_min, tandip_max=tandip_max,
             )
             val_dataset = FlatClassifierDataset(
                 val_data_path, max_tracks, require_calo=require_calo,
+                tandip_min=tandip_min, tandip_max=tandip_max,
             )
         elif momentum_like:
             use_calo = kwargs.get("use_calo", False)
@@ -661,14 +748,20 @@ def create_dataloaders(
             train_dataset = FlatMomentumDataset(
                 train_data_path, max_tracks, use_calo=use_calo,
                 require_calo=require_calo,
+                tandip_min=tandip_min, tandip_max=tandip_max,
             )
             val_dataset = FlatMomentumDataset(
                 val_data_path, max_tracks, use_calo=use_calo,
                 require_calo=require_calo,
+                tandip_min=tandip_min, tandip_max=tandip_max,
             )
         else:
-            train_dataset = FlatHDF5Dataset(train_data_path, max_tracks)
-            val_dataset   = FlatHDF5Dataset(val_data_path,   max_tracks)
+            train_dataset = FlatHDF5Dataset(
+                train_data_path, max_tracks, tandip_min, tandip_max
+            )
+            val_dataset = FlatHDF5Dataset(
+                val_data_path, max_tracks, tandip_min, tandip_max
+            )
     else:
         train_is_dir = Path(train_data_path).is_dir()
         val_is_dir   = Path(val_data_path).is_dir()
@@ -677,15 +770,31 @@ def create_dataloaders(
         val_cache   = str(Path(output_dir) / "val_index.pkl")   if output_dir else None
 
         if momentum_like:
-            train_dataset = (MultiFileMomentumDataset(train_data_path, channel_index, feature_names, max_tracks, train_cache)
-                             if train_is_dir else MomentumTrackDataset(train_data_path, channel_index, feature_names, max_tracks))
-            val_dataset   = (MultiFileMomentumDataset(val_data_path, channel_index, feature_names, max_tracks, val_cache)
-                             if val_is_dir else MomentumTrackDataset(val_data_path, channel_index, feature_names, max_tracks))
+            train_dataset = (MultiFileMomentumDataset(
+                train_data_path, channel_index, feature_names, max_tracks, train_cache,
+                tandip_min, tandip_max)
+                if train_is_dir else MomentumTrackDataset(
+                    train_data_path, channel_index, feature_names, max_tracks,
+                    tandip_min, tandip_max))
+            val_dataset = (MultiFileMomentumDataset(
+                val_data_path, channel_index, feature_names, max_tracks, val_cache,
+                tandip_min, tandip_max)
+                if val_is_dir else MomentumTrackDataset(
+                    val_data_path, channel_index, feature_names, max_tracks,
+                    tandip_min, tandip_max))
         else:
-            train_dataset = (MultiFileHDF5Dataset(train_data_path, channel_index, feature_names, max_tracks, train_cache)
-                             if train_is_dir else TrackHDF5Dataset(train_data_path, channel_index, feature_names, max_tracks))
-            val_dataset   = (MultiFileHDF5Dataset(val_data_path, channel_index, feature_names, max_tracks, val_cache)
-                             if val_is_dir else TrackHDF5Dataset(val_data_path, channel_index, feature_names, max_tracks))
+            train_dataset = (MultiFileHDF5Dataset(
+                train_data_path, channel_index, feature_names, max_tracks, train_cache,
+                tandip_min, tandip_max)
+                if train_is_dir else TrackHDF5Dataset(
+                    train_data_path, channel_index, feature_names, max_tracks,
+                    tandip_min, tandip_max))
+            val_dataset = (MultiFileHDF5Dataset(
+                val_data_path, channel_index, feature_names, max_tracks, val_cache,
+                tandip_min, tandip_max)
+                if val_is_dir else TrackHDF5Dataset(
+                    val_data_path, channel_index, feature_names, max_tracks,
+                    tandip_min, tandip_max))
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
@@ -1146,6 +1255,14 @@ def main() -> None:
     parser.add_argument("--infer-channel-index", type=int, default=None)
     parser.add_argument("--pooling-type", choices=["mean", "max", "attention"], default="mean")
     parser.add_argument("--max-tracks", type=int, default=None)
+    parser.add_argument(
+        "--tandip-min", type=float, default=DEFAULT_TANDIP_MIN,
+        help=f"Inclusive signed tandip lower bound (default: {DEFAULT_TANDIP_MIN}).",
+    )
+    parser.add_argument(
+        "--tandip-max", type=float, default=DEFAULT_TANDIP_MAX,
+        help=f"Inclusive signed tandip upper bound (default: {DEFAULT_TANDIP_MAX}).",
+    )
     parser.add_argument("--compile", action="store_true", default=False)
     parser.add_argument(
         "--init-encoder-from", default=None, metavar="CHECKPOINT",
@@ -1218,6 +1335,10 @@ def main() -> None:
         parser.error("--init-encoder-from is only valid with --model-type cvn_classifier")
     if args.init_encoder_from and args.resume:
         parser.error("--init-encoder-from and --resume are mutually exclusive")
+    if not (math.isfinite(args.tandip_min) and math.isfinite(args.tandip_max)):
+        parser.error("--tandip-min and --tandip-max must be finite")
+    if args.tandip_min > args.tandip_max:
+        parser.error("--tandip-min must be less than or equal to --tandip-max")
 
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
@@ -1318,6 +1439,7 @@ def main() -> None:
         batch_size=args.batch_size, num_workers=args.num_workers, task=args.model_type,
         max_tracks=args.max_tracks, output_dir=str(output_dir), flat_format=args.flat_format,
         use_calo=use_calo, require_calo=args.require_calo,
+        tandip_min=args.tandip_min, tandip_max=args.tandip_max,
     )
     if args.require_calo:
         logger.info(
@@ -1325,6 +1447,10 @@ def main() -> None:
             "calo_matched=True; calorimeter input features remain controlled "
             "independently by --use-calo."
         )
+    logger.info(
+        "Signed tandip selection: %.6g <= tandip <= %.6g (inclusive)",
+        args.tandip_min, args.tandip_max,
+    )
     logger.info(f"Train tracks: {len(train_loader.dataset):,} | Val tracks: {len(val_loader.dataset):,}")
     class_counts: Optional[Dict[str, Dict[str, int]]] = None
     pos_weight_value: Optional[float] = None
@@ -1444,6 +1570,8 @@ def main() -> None:
         "accumulation_steps": args.accumulation_steps,
         "batch_size": args.batch_size,
         "require_calo": args.require_calo,
+        "tandip_min": args.tandip_min,
+        "tandip_max": args.tandip_max,
         "class_counts": class_counts,
         "pos_weight": pos_weight_value,
         "min_lr": 1e-6,
@@ -1492,16 +1620,21 @@ def main() -> None:
                 "LR/schedule compatibility cannot be validated."
             )
         else:
+            legacy_training_defaults = {
+                "require_calo": False,
+                "tandip_min": DEFAULT_TANDIP_MIN,
+                "tandip_max": DEFAULT_TANDIP_MAX,
+            }
             mismatches = {
                 key: (
                     saved_training_config.get(
-                        key, False if key == "require_calo" else None
+                        key, legacy_training_defaults.get(key)
                     ),
                     value,
                 )
                 for key, value in training_config.items()
                 if saved_training_config.get(
-                    key, False if key == "require_calo" else None
+                    key, legacy_training_defaults.get(key)
                 ) != value
             }
             if mismatches:

@@ -12,6 +12,8 @@ from train import (
     MultiFileMomentumDataset,
     MomentumTrackDataset,
     FlatMomentumDataset,
+    DEFAULT_TANDIP_MIN,
+    DEFAULT_TANDIP_MAX,
     sparse_collate_fn,
 )
 from torch.utils.data import DataLoader
@@ -479,6 +481,10 @@ def main():
                              "cluster, using the flat-file calo_matched field. "
                              "This filters samples only and does not enable "
                              "calorimeter input features.")
+    parser.add_argument("--tandip-min", type=float, default=None,
+                        help="Inclusive signed lower bound (default: checkpoint setting).")
+    parser.add_argument("--tandip-max", type=float, default=None,
+                        help="Inclusive signed upper bound (default: checkpoint setting).")
     args = parser.parse_args()
 
     run_path = Path(args.run_dir)
@@ -487,6 +493,14 @@ def main():
     # 1. Load weights & configuration metadata
     checkpoint = torch.load(run_path / "best_model.pt", map_location=device)
     config_dict = checkpoint["config"]
+    training_config = checkpoint.get("training_config", {})
+    tandip_min = (args.tandip_min if args.tandip_min is not None
+                  else training_config.get("tandip_min", DEFAULT_TANDIP_MIN))
+    tandip_max = (args.tandip_max if args.tandip_max is not None
+                  else training_config.get("tandip_max", DEFAULT_TANDIP_MAX))
+    if not (np.isfinite(tandip_min) and np.isfinite(tandip_max)
+            and tandip_min <= tandip_max):
+        parser.error("resolved tandip bounds must be finite with minimum <= maximum")
     config = TrackModelConfig(**config_dict)
     
     model = TrackReconstructionModel(**config.to_dict())
@@ -513,12 +527,19 @@ def main():
 
     if is_flat:
         test_dataset = FlatMomentumDataset(
-            args.test_data, require_calo=args.require_calo
+            args.test_data, require_calo=args.require_calo,
+            tandip_min=tandip_min, tandip_max=tandip_max,
         )
     elif test_path.is_dir():
-        test_dataset = MultiFileMomentumDataset(args.test_data, channel_index)
+        test_dataset = MultiFileMomentumDataset(
+            args.test_data, channel_index,
+            tandip_min=tandip_min, tandip_max=tandip_max,
+        )
     else:
-        test_dataset = MomentumTrackDataset(args.test_data, channel_index)
+        test_dataset = MomentumTrackDataset(
+            args.test_data, channel_index,
+            tandip_min=tandip_min, tandip_max=tandip_max,
+        )
 
     if args.require_calo:
         print(

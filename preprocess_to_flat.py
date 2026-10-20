@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 CALO_SCALAR_COLS = [
     c for c in TRACK_SCALAR_ATTRS
-    if c not in ('true_mom_x', 'true_mom_y', 'true_mom_z', 'calo_matched')
+    if c not in ('true_mom_x', 'true_mom_y', 'true_mom_z', 'tandip', 'calo_matched')
 ]
 
 MAX_CRYSTALS = 20
@@ -74,6 +74,7 @@ def _write_flat_h5(
     ch_indices: np.ndarray,
     offsets: np.ndarray,
     mom_xyz: Optional[np.ndarray],
+    tandip: np.ndarray,
     calo_scalars: np.ndarray,
     calo_matched_arr: np.ndarray,
     calo_hits_padded: np.ndarray,
@@ -88,6 +89,7 @@ def _write_flat_h5(
         out.create_dataset("features",         data=features,          compression="lzf", chunks=True)
         out.create_dataset("ch_indices",       data=ch_indices,        compression="lzf", chunks=True)
         out.create_dataset("offsets",          data=offsets,           compression="lzf", chunks=True)
+        out.create_dataset("tandip",           data=tandip,            compression="lzf", chunks=True)
         out.create_dataset("calo_scalars",     data=calo_scalars,      compression="lzf", chunks=True)
         out.create_dataset("calo_matched",     data=calo_matched_arr,  compression="lzf", chunks=True)
         out.create_dataset("calo_hits_padded", data=calo_hits_padded,  compression="lzf", chunks=True)
@@ -144,6 +146,7 @@ def _process_single_file(
     all_indices:        List[np.ndarray] = []
     all_offsets:        List[int]        = [0]
     all_mom:            List[np.ndarray] = []
+    all_tandip:         List[float]      = []
     all_calo_scalars:   List[np.ndarray] = []
     all_calo_matched:   List[bool]       = []
     all_calo_padded:    List[np.ndarray] = []
@@ -193,6 +196,17 @@ def _process_single_file(
                 continue
             # ----------------------------------------------------------------
 
+            if "tandip" not in track_group.attrs:
+                raise RuntimeError(
+                    f"Track {track_name} in {src_path} has no tandip attribute; "
+                    "regenerate the grouped HDF5 file with the updated extractor."
+                )
+            track_tandip = float(track_group.attrs["tandip"])
+            if not np.isfinite(track_tandip):
+                raise RuntimeError(
+                    f"Track {track_name} in {src_path} has non-finite tandip={track_tandip}."
+                )
+
             # Momentum cut (only when momentum is required by downstream training).
             if has_momentum:
                 px = float(track_group.attrs.get("true_mom_x", np.nan))
@@ -219,6 +233,7 @@ def _process_single_file(
             all_indices.append(ch_idx)
             all_offsets.append(all_offsets[-1] + len(ch_idx))
             track_names.append(track_name)
+            all_tandip.append(track_tandip)
 
             if has_momentum:
                 all_mom.append(np.array([px, py, pz], dtype=np.float32))
@@ -263,6 +278,7 @@ def _process_single_file(
     ch_indices = np.concatenate(all_indices, axis=0) if all_indices else np.empty(0, dtype=np.int32)
     offsets = np.array(all_offsets, dtype=np.int64)
     mom_xyz = np.stack(all_mom, axis=0) if (has_momentum and all_mom) else (np.empty((0, 3), dtype=np.float32) if has_momentum else None)
+    tandip = np.asarray(all_tandip, dtype=np.float32)
     calo_scalars = np.stack(all_calo_scalars, axis=0) if all_calo_scalars else np.empty((0, n_calo), dtype=np.float32)
     calo_matched_arr = np.array(all_calo_matched, dtype=bool)
     calo_hits_padded = np.stack(all_calo_padded, axis=0) if all_calo_padded else np.empty((0, max_crystals, n_calo_hit_feats), dtype=np.float32)
@@ -270,7 +286,7 @@ def _process_single_file(
 
     # WRITE DIRECTLY FROM THE WORKER PROCESS
     _write_flat_h5(
-        out_path, features, ch_indices, offsets, mom_xyz,
+        out_path, features, ch_indices, offsets, mom_xyz, tandip,
         calo_scalars, calo_matched_arr, calo_hits_padded, calo_n_crystals,
         track_names, feature_names, calo_scalar_cols, max_crystals,
     )

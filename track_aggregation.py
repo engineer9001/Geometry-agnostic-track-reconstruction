@@ -31,6 +31,7 @@ TRACK_SCALAR_ATTRS = [
     'true_mom_x',    # float32 — true initial momentum x [MeV/c]
     'true_mom_y',    # float32 — true initial momentum y [MeV/c]
     'true_mom_z',    # float32 — true initial momentum z [MeV/c]
+    'tandip',         # float32 — signed p_z / p_transverse at trksegsmc sid == 0
     # Calorimeter cluster (NaN if no match)
     'calo_matched',  # bool — True if a calo cluster was matched
     'calo_edep',     # float32 — cluster energy deposit [MeV]
@@ -153,6 +154,11 @@ def aggregate_hits_to_hdf5(hit_df, h5_path, group_root='tracks',
                 else:
                     stats['nan_mom'] += 1
 
+            # Non-calorimeter track scalars are persisted independently of
+            # whether this track has a calorimeter match.
+            if 'tandip' in available_scalar_attrs:
+                g.attrs['tandip'] = float(group['tandip'].iloc[0])
+
             # Calorimeter scalars
             if has_calo:
                 c_matched = bool(group['calo_matched'].iloc[0])
@@ -163,7 +169,7 @@ def aggregate_hits_to_hdf5(hit_df, h5_path, group_root='tracks',
                     stats['calo_unmatched'] += 1
 
                 for col in available_scalar_attrs:
-                    if col in ('true_mom_x', 'true_mom_y', 'true_mom_z', 'calo_matched'):
+                    if col in ('true_mom_x', 'true_mom_y', 'true_mom_z', 'tandip', 'calo_matched'):
                         continue
                     val = group[col].iloc[0]
                     

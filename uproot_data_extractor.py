@@ -81,7 +81,8 @@ def uproot_data_extractor(filepaths_string):
 
     hit_df : pd.DataFrame
         One row per tracker straw hit. Columns include hit_id, x/y/z_position,
-        hit_rho, hit_position, edep, t0, t1, t_diff, true_mom_x/y/z, calo_matched,
+        hit_rho, hit_position, edep, t0, t1, t_diff, true_mom_x/y/z, tandip,
+        calo_matched,
         and all calo_* cluster-level scalars (same value repeated for every
         hit row belonging to that track).
 
@@ -110,6 +111,7 @@ def uproot_data_extractor(filepaths_string):
     calo_hits_dict = {}
     file_counter = 0
     duplicate_tracks_skipped = 0
+    malformed_tandip_tracks = 0
 
     file_list = filepaths_string.strip().split()
     if not file_list:
@@ -120,6 +122,7 @@ def uproot_data_extractor(filepaths_string):
     branches_to_load = [
         "trkhits",
         "trkmcsim",
+        "trksegsmc",
         "trkcalohit",
     ]
 
@@ -211,6 +214,13 @@ def uproot_data_extractor(filepaths_string):
         # prirel is a split MCRelationship record; _rel carries its enum value.
         primary_relation = mcsim['prirel']['_rel']
 
+        # --- Extract signed tan(dip) from the unique sid == 0 segment ---
+        segments = trkana["trksegsmc"]
+        segment_sid = segments["sid"]
+        segment_px = segments["mom"]["fCoordinates"]["fX"]
+        segment_py = segments["mom"]["fCoordinates"]["fY"]
+        segment_pz = segments["mom"]["fCoordinates"]["fZ"]
+
         # --- Extract Track-Level Calorimeter Cluster (one per track) ---
         calo = trkana["trkcalohit"]
         calo_edep      = calo["trkcalohit.edep"]
@@ -282,6 +292,28 @@ def uproot_data_extractor(filepaths_string):
                 ev_cc_time = np.array([], dtype=np.float64)
 
             for track_idx in range(num_tracks):
+                # tandip is defined by the unique tracker segment at sid == 0.
+                # Keep the sign of pz.
+                sid_arr = ak.to_numpy(segment_sid[count][track_idx])
+                sid0_indices = np.flatnonzero(sid_arr == 0)
+                if len(sid0_indices) != 1:
+                    malformed_tandip_tracks += 1
+                    continue
+                sid0_idx = int(sid0_indices[0])
+                seg_px = float(segment_px[count][track_idx][sid0_idx])
+                seg_py = float(segment_py[count][track_idx][sid0_idx])
+                seg_pz = float(segment_pz[count][track_idx][sid0_idx])
+                p_transverse = np.hypot(seg_px, seg_py)
+                if (not np.isfinite(seg_px) or not np.isfinite(seg_py)
+                        or not np.isfinite(seg_pz) or not np.isfinite(p_transverse)
+                        or p_transverse == 0.0):
+                    malformed_tandip_tracks += 1
+                    continue
+                tandip = seg_pz / p_transverse
+                if not np.isfinite(tandip):
+                    malformed_tandip_tracks += 1
+                    continue
+
                 p_arr = ak.to_numpy(plane[count][track_idx])
                 if len(p_arr) == 0:
                     continue
@@ -406,6 +438,7 @@ def uproot_data_extractor(filepaths_string):
                     'true_mom_x'   : np.full(n_hits, t_px),
                     'true_mom_y'   : np.full(n_hits, t_py),
                     'true_mom_z'   : np.full(n_hits, t_pz),
+                    'tandip'       : np.full(n_hits, tandip),
                     # Calorimeter cluster — same scalar repeated for every hit row
                     'calo_edep'      : np.full(n_hits, c_edep),
                     'calo_edeperr'   : np.full(n_hits, c_edeperr),
@@ -438,6 +471,8 @@ def uproot_data_extractor(filepaths_string):
                 # Store crystal hits keyed by (event_key, dedup_track_idx)
                 calo_hits_dict[(event_key, dedup_track_idx)] = crystal_hits
 
+    if malformed_tandip_tracks > 0:
+        print(f'\nSkipped {malformed_tandip_tracks} track(s) with invalid sid == 0 segment data.')
     if not feature_variables:
         print('\n\033[91mNo tracks matched the filtering criteria across files.\033[0m')
         return pd.DataFrame(), {}
