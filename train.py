@@ -36,6 +36,31 @@ from nedt import build_sparse_track_from_hdf5_group, infer_channel_index_from_hd
 
 DEFAULT_TANDIP_MIN = 0.41
 DEFAULT_TANDIP_MAX = 1.2
+BINARY_CLASSIFIER_TASKS = ("cvn_classifier", "cvn_pz_classifier")
+SUPERVISED_TRACK_TASKS = (
+    "momentum", "abs_momentum", "cvn_momentum", *BINARY_CLASSIFIER_TASKS,
+)
+
+
+def validate_classifier_splits(
+    task: str, train_counts: Dict[int, int], val_counts: Dict[int, int],
+) -> None:
+    """Reject binary-classifier splits missing either target class."""
+    train_has_both = min(train_counts.get(0, 0), train_counts.get(1, 0)) > 0
+    val_has_both = min(val_counts.get(0, 0), val_counts.get(1, 0)) > 0
+    if train_has_both and val_has_both:
+        return
+    class_description = (
+        "Ce and DIO" if task == "cvn_classifier"
+        else "positive-pz and negative-pz"
+    )
+    raise RuntimeError(
+        f"{task} requires both {class_description} tracks in training and "
+        f"validation; got train={train_counts}, validation={val_counts}. "
+        "Check the signed --tandip bounds and avoid a class-truncating "
+        "--max-tracks value."
+    )
+
 
 
 def _flat_tandip_mask(f: "h5py.File", n_tracks: int,
@@ -574,6 +599,61 @@ class FlatMomentumDataset(Dataset):
                 crystal_feats, crystal_ids, n_crys)
 
 
+
+class FlatPzSignDataset(FlatMomentumDataset):
+    """Flat CSR tracks labelled by initial momentum sign (+pz=1, -pz=0)."""
+
+    def __init__(
+        self,
+        data_path: str,
+        max_tracks: Optional[int] = None,
+        require_calo: bool = False,
+        tandip_min: float = DEFAULT_TANDIP_MIN,
+        tandip_max: float = DEFAULT_TANDIP_MAX,
+    ):
+        super().__init__(
+            data_path, max_tracks=max_tracks, use_calo=False,
+            require_calo=require_calo, tandip_min=tandip_min,
+            tandip_max=tandip_max,
+        )
+        by_file: Dict[int, List[int]] = {}
+        for file_idx, track_idx in self.track_index:
+            by_file.setdefault(file_idx, []).append(track_idx)
+
+        selected: List[Tuple[int, int]] = []
+        self.class_counts = {0: 0, 1: 0}
+        for file_idx, track_indices in by_file.items():
+            with h5py.File(self.h5_files[file_idx], "r") as f:
+                if "mom_xyz" not in f:
+                    raise RuntimeError(
+                        f"cvn_pz_classifier requires mom_xyz truth in {f.filename}"
+                    )
+                mom_xyz = f["mom_xyz"]
+                n_tracks = len(f["offsets"]) - 1
+                if mom_xyz.ndim != 2 or mom_xyz.shape[0] != n_tracks or mom_xyz.shape[1] < 3:
+                    raise RuntimeError(
+                        f"Invalid mom_xyz shape in {f.filename}: expected "
+                        f"({n_tracks}, >=3), got {mom_xyz.shape}"
+                    )
+                pz_values = np.asarray(mom_xyz[:, 2], dtype=np.float32)
+            for track_idx in track_indices:
+                pz = float(pz_values[track_idx])
+                if not math.isfinite(pz) or pz == 0.0:
+                    continue
+                label = int(pz > 0.0)
+                selected.append((file_idx, track_idx))
+                self.class_counts[label] += 1
+        self.track_index = selected
+        if not self.track_index:
+            raise RuntimeError("No tracks with finite, nonzero initial pz were selected")
+
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
+        features, channels, momentum = super().__getitem__(idx)
+        label = torch.tensor(float(momentum[2] > 0.0), dtype=torch.float32)
+        return features, channels, label
+
+
+
 def infer_binary_label_from_filename(path: str) -> int:
     """Infer the track class from an HDF5 basename (Ce=1, DIO=0)."""
     name = Path(path).name
@@ -724,21 +804,25 @@ def create_dataloaders(
     """Create train and validation dataloaders."""
 
     momentum_like = task in ("momentum", "abs_momentum", "cvn_momentum")
-    classifier = task == "cvn_classifier"
+    classifier = task in BINARY_CLASSIFIER_TASKS
     tandip_min = kwargs.get("tandip_min", DEFAULT_TANDIP_MIN)
     tandip_max = kwargs.get("tandip_max", DEFAULT_TANDIP_MAX)
 
     if classifier and not flat_format:
-        raise ValueError("cvn_classifier requires --flat-format")
+        raise ValueError(f"{task} requires --flat-format")
 
     if flat_format:
         if classifier:
             require_calo = kwargs.get("require_calo", False)
-            train_dataset = FlatClassifierDataset(
+            dataset_type = (
+                FlatPzSignDataset if task == "cvn_pz_classifier"
+                else FlatClassifierDataset
+            )
+            train_dataset = dataset_type(
                 train_data_path, max_tracks, require_calo=require_calo,
                 tandip_min=tandip_min, tandip_max=tandip_max,
             )
-            val_dataset = FlatClassifierDataset(
+            val_dataset = dataset_type(
                 val_data_path, max_tracks, require_calo=require_calo,
                 tandip_min=tandip_min, tandip_max=tandip_max,
             )
@@ -933,8 +1017,8 @@ def train_epoch(
     amp_device = device.type
 
     pbar = tqdm(dataloader, desc="Training", total=steps_per_epoch)
-    supervised_track = task in ("momentum", "abs_momentum", "cvn_momentum", "cvn_classifier")
-    classifier = task == "cvn_classifier"
+    supervised_track = task in SUPERVISED_TRACK_TASKS
+    classifier = task in BINARY_CLASSIFIER_TASKS
     correct = 0
     n_examples = 0
     logger = logging.getLogger(__name__)
@@ -1134,8 +1218,8 @@ def validate(
     use_amp = device.type == "cuda"
     amp_device = device.type
 
-    supervised_track = task in ("momentum", "abs_momentum", "cvn_momentum", "cvn_classifier")
-    classifier = task == "cvn_classifier"
+    supervised_track = task in SUPERVISED_TRACK_TASKS
+    classifier = task in BINARY_CLASSIFIER_TASKS
     correct = 0
     n_examples = 0
     with torch.no_grad():
@@ -1237,7 +1321,7 @@ def main() -> None:
     parser.add_argument("--max-channels", type=int, default=50000)
     parser.add_argument(
         "--model-type",
-        choices=["reconstruction", "denoising", "momentum", "abs_momentum", "cvn_momentum", "cvn_classifier"],
+        choices=["reconstruction", "denoising", "momentum", "abs_momentum", "cvn_momentum", "cvn_classifier", "cvn_pz_classifier"],
         default="reconstruction",
         help="Task head to train. 'momentum' predicts (px, py, pz); "
              "'abs_momentum' predicts (pT, |pz|) to break the forward/backward "
@@ -1245,7 +1329,8 @@ def main() -> None:
              "'cvn_momentum' uses a geometry-aware convolutional-neighbor "
              "stem in front of the transformer and predicts (pT, |pz|); "
              "'cvn_classifier' uses that encoder to classify Ce (1) vs DIO (0) "
-             "from flat-file source names.",
+             "from flat-file source names; 'cvn_pz_classifier' predicts the "
+             "initial momentum sign, +pz (1) vs -pz (0), from mom_xyz truth.",
     )
     parser.add_argument("--loss-fn", choices=["mse", "l1"], default="mse")
     parser.add_argument("--accumulation-steps", type=int, default=1)
@@ -1266,8 +1351,8 @@ def main() -> None:
     parser.add_argument("--compile", action="store_true", default=False)
     parser.add_argument(
         "--init-encoder-from", default=None, metavar="CHECKPOINT",
-        help="For cvn_classifier only, initialize compatible encoder weights "
-             "from a cvn_momentum checkpoint while keeping a fresh classifier head.",
+        help="For a CVN classifier, initialize compatible encoder weights from "
+             "a cvn_momentum checkpoint while keeping a fresh classifier head.",
     )
     parser.add_argument("--steps-per-epoch", type=int, default=None)
     parser.add_argument("--flat-format", action="store_true", default=False)
@@ -1321,18 +1406,18 @@ def main() -> None:
     args = parser.parse_args([*config_argv, *remaining_argv])
     args.config_file = config_selector.config_file
 
-    supervised_types = ("momentum", "abs_momentum", "cvn_momentum", "cvn_classifier")
+    supervised_types = SUPERVISED_TRACK_TASKS
     if args.require_calo and (
         not args.flat_format or args.model_type not in supervised_types
     ):
         parser.error(
             "--require-calo requires --flat-format and --model-type in "
-            "{momentum, abs_momentum, cvn_momentum, cvn_classifier}"
+            "{momentum, abs_momentum, cvn_momentum, cvn_classifier, cvn_pz_classifier}"
         )
-    if args.model_type == "cvn_classifier" and not args.flat_format:
-        parser.error("--model-type cvn_classifier requires --flat-format")
-    if args.init_encoder_from and args.model_type != "cvn_classifier":
-        parser.error("--init-encoder-from is only valid with --model-type cvn_classifier")
+    if args.model_type in BINARY_CLASSIFIER_TASKS and not args.flat_format:
+        parser.error(f"--model-type {args.model_type} requires --flat-format")
+    if args.init_encoder_from and args.model_type not in BINARY_CLASSIFIER_TASKS:
+        parser.error("--init-encoder-from is only valid with a CVN classifier")
     if args.init_encoder_from and args.resume:
         parser.error("--init-encoder-from and --resume are mutually exclusive")
     if not (math.isfinite(args.tandip_min) and math.isfinite(args.tandip_max)):
@@ -1454,23 +1539,23 @@ def main() -> None:
     logger.info(f"Train tracks: {len(train_loader.dataset):,} | Val tracks: {len(val_loader.dataset):,}")
     class_counts: Optional[Dict[str, Dict[str, int]]] = None
     pos_weight_value: Optional[float] = None
-    if args.model_type == "cvn_classifier":
+    if args.model_type in BINARY_CLASSIFIER_TASKS:
         train_counts = train_loader.dataset.class_counts
         val_counts = val_loader.dataset.class_counts
-        if min(train_counts.values()) == 0 or min(val_counts.values()) == 0:
-            raise RuntimeError(
-                "cvn_classifier requires both Ce and DIO tracks in training and validation; "
-                f"got train={train_counts}, validation={val_counts}. "
-                "Check filenames and avoid a class-truncating --max-tracks value."
-            )
+        validate_classifier_splits(args.model_type, train_counts, val_counts)
         pos_weight_value = train_counts[0] / train_counts[1]
+        class_names = (
+            ("dio", "ce") if args.model_type == "cvn_classifier"
+            else ("negative_pz", "positive_pz")
+        )
         class_counts = {
-            "train": {"dio": train_counts[0], "ce": train_counts[1]},
-            "validation": {"dio": val_counts[0], "ce": val_counts[1]},
+            "train": {class_names[0]: train_counts[0], class_names[1]: train_counts[1]},
+            "validation": {class_names[0]: val_counts[0], class_names[1]: val_counts[1]},
         }
         logger.info(
-            f"Classifier classes | train: Ce={train_counts[1]:,}, DIO={train_counts[0]:,} | "
-            f"validation: Ce={val_counts[1]:,}, DIO={val_counts[0]:,} | "
+            f"Classifier classes | train: {class_names[1]}={train_counts[1]:,}, "
+            f"{class_names[0]}={train_counts[0]:,} | validation: "
+            f"{class_names[1]}={val_counts[1]:,}, {class_names[0]}={val_counts[0]:,} | "
             f"BCE pos_weight={pos_weight_value:.6g}"
         )
     logger.info(f"Train batches/epoch: {len(train_loader):,} | Val batches: {len(val_loader):,}")
@@ -1722,7 +1807,7 @@ def main() -> None:
     best_val_loss = float("inf")
     patience, patience_counter = 15, 0
     history = {"train_loss": [], "val_loss": []}
-    if args.model_type == "cvn_classifier":
+    if args.model_type in BINARY_CLASSIFIER_TASKS:
         history.update({"train_accuracy": [], "val_accuracy": []})
     rolling_ckpts: List[Path] = []  # FIFO of last-N per-epoch checkpoints
     divergence_frac = args.divergence_frac if args.divergence_frac > 0 else None
@@ -1770,7 +1855,7 @@ def main() -> None:
 
     if args.model_type == "momentum":
         loss_fn = momentum_loss
-    elif args.model_type == "cvn_classifier":
+    elif args.model_type in BINARY_CLASSIFIER_TASKS:
         loss_fn = nn.BCEWithLogitsLoss(
             pos_weight=torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
         )
@@ -1813,7 +1898,7 @@ def main() -> None:
                 grad_clip=args.grad_clip if args.grad_clip > 0 else None,
                 divergence_frac=divergence_frac,
             )
-            if args.model_type == "cvn_classifier":
+            if args.model_type in BINARY_CLASSIFIER_TASKS:
                 train_loss, train_accuracy = train_result
             else:
                 train_loss = train_result
@@ -1831,20 +1916,20 @@ def main() -> None:
                 json.dump(history, f, indent=2)
             return
         val_result = validate(model, val_loader, device, loss_fn=loss_fn, task=args.model_type)
-        if args.model_type == "cvn_classifier":
+        if args.model_type in BINARY_CLASSIFIER_TASKS:
             val_loss, val_accuracy = val_result
         else:
             val_loss = val_result
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
-        if args.model_type == "cvn_classifier":
+        if args.model_type in BINARY_CLASSIFIER_TASKS:
             history["train_accuracy"].append(train_accuracy)
             history["val_accuracy"].append(val_accuracy)
 
         current_lr = optimizer.param_groups[0]["lr"]
         metric_text = ""
-        if args.model_type == "cvn_classifier":
+        if args.model_type in BINARY_CLASSIFIER_TASKS:
             metric_text = (
                 f" | Train Accuracy: {train_accuracy:.4f} | "
                 f"Val Accuracy: {val_accuracy:.4f}"
@@ -1878,8 +1963,8 @@ def main() -> None:
                     "epoch": epoch + 1,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
-                    "train_accuracy": train_accuracy if args.model_type == "cvn_classifier" else None,
-                    "val_accuracy": val_accuracy if args.model_type == "cvn_classifier" else None,
+                    "train_accuracy": train_accuracy if args.model_type in BINARY_CLASSIFIER_TASKS else None,
+                    "val_accuracy": val_accuracy if args.model_type in BINARY_CLASSIFIER_TASKS else None,
                     "class_counts": class_counts,
                     "pos_weight": pos_weight_value,
                     "init_encoder_from": args.init_encoder_from,
@@ -1907,8 +1992,8 @@ def main() -> None:
                     "global_step": global_step,
                     "train_loss": train_loss,
                     "val_loss": val_loss,
-                    "train_accuracy": train_accuracy if args.model_type == "cvn_classifier" else None,
-                    "val_accuracy": val_accuracy if args.model_type == "cvn_classifier" else None,
+                    "train_accuracy": train_accuracy if args.model_type in BINARY_CLASSIFIER_TASKS else None,
+                    "val_accuracy": val_accuracy if args.model_type in BINARY_CLASSIFIER_TASKS else None,
                     "class_counts": class_counts,
                     "pos_weight": pos_weight_value,
                     "init_encoder_from": args.init_encoder_from,

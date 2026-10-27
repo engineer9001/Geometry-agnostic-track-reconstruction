@@ -892,7 +892,7 @@ class TrackReconstructionModel(nn.Module):
         # The CvN variant swaps only the straw-token embedding stage for a
         # geometry-aware neighbor conv; everything downstream (PE, detector
         # type embedding, transformer stack, heads) is identical.
-        if task in ("cvn_momentum", "cvn_classifier"):
+        if task in ("cvn_momentum", "cvn_classifier", "cvn_pz_classifier"):
             self.encoder = CvnMaskedTransformerEncoder(
                 input_dim=input_dim,
                 d_model=d_model,
@@ -937,7 +937,7 @@ class TrackReconstructionModel(nn.Module):
                 dropout=dropout,
                 pooling_type=pooling_type,
             )
-        elif task == "cvn_classifier":
+        elif task in ("cvn_classifier", "cvn_pz_classifier"):
             self.head = BinaryClassificationHead(
                 d_model,
                 dim_feedforward=dim_feedforward,
@@ -974,7 +974,7 @@ class TrackReconstructionModel(nn.Module):
             crystal_ch=crystal_ch,
         )
 
-        if self.task in ("momentum", "abs_momentum", "cvn_momentum", "cvn_classifier"):
+        if self.task in ("momentum", "abs_momentum", "cvn_momentum", "cvn_classifier", "cvn_pz_classifier"):
             return self.head(encoded, mask=combined_mask)
         return self.head(encoded)
 
