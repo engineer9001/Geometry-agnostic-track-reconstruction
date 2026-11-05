@@ -539,32 +539,47 @@ class FlatMomentumDataset(Dataset):
                 )
 
         self.track_index: List[Tuple[int, int]] = []
+        unreadable_shards: List[Tuple[str, str]] = []
         for file_idx, h5_file in enumerate(self.h5_files):
-            with h5py.File(h5_file, "r") as f:
-                n = int(f.attrs.get("n_tracks", len(f["offsets"]) - 1))
-                selected = _flat_tandip_mask(f, n, tandip_min, tandip_max)
-                if require_calo:
-                    if "calo_matched" not in f:
-                        raise RuntimeError(
-                            f"--require-calo requested but flat file {h5_file} "
-                            "has no 'calo_matched' dataset. Re-run "
-                            "preprocess_to_flat.py to regenerate it."
-                        )
-                    matched = np.asarray(f["calo_matched"][:], dtype=bool)
-                    if matched.shape != (n,):
-                        raise RuntimeError(
-                            f"Invalid calo_matched shape in {h5_file}: "
-                            f"expected ({n},), got {matched.shape}."
-                        )
-                    selected &= matched
-                track_indices = np.flatnonzero(selected)
+            try:
+                with h5py.File(h5_file, "r") as f:
+                    n = int(f.attrs.get("n_tracks", len(f["offsets"]) - 1))
+                    selected = _flat_tandip_mask(f, n, tandip_min, tandip_max)
+                    if require_calo:
+                        if "calo_matched" not in f:
+                            raise RuntimeError(
+                                f"--require-calo requested but flat file {h5_file} "
+                                "has no 'calo_matched' dataset. Re-run "
+                                "preprocess_to_flat.py to regenerate it."
+                            )
+                        matched = np.asarray(f["calo_matched"][:], dtype=bool)
+                        if matched.shape != (n,):
+                            raise RuntimeError(
+                                f"Invalid calo_matched shape in {h5_file}: "
+                                f"expected ({n},), got {matched.shape}."
+                            )
+                        selected &= matched
+                    track_indices = np.flatnonzero(selected)
 
-                for ti in track_indices:
-                    self.track_index.append((file_idx, int(ti)))
-                    if max_tracks and len(self.track_index) >= max_tracks:
-                        break
+                    for ti in track_indices:
+                        self.track_index.append((file_idx, int(ti)))
+                        if max_tracks and len(self.track_index) >= max_tracks:
+                            break
+            except OSError as exc:
+                unreadable_shards.append((h5_file, str(exc)))
             if max_tracks and len(self.track_index) >= max_tracks:
                 break
+
+        if unreadable_shards:
+            details = "\n".join(
+                f"  - {path}: {error}" for path, error in unreadable_shards
+            )
+            raise RuntimeError(
+                f"Could not open {len(unreadable_shards)} flat HDF5 shard(s). "
+                "These files have HDF5 signatures but unreadable internal "
+                "objects and may be truncated or corrupt. Replace or regenerate "
+                f"them before training:\n{details}"
+            )
 
     def __len__(self) -> int:
         return len(self.track_index)

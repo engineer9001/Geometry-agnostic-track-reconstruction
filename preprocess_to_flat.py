@@ -126,7 +126,7 @@ def _process_single_file(
     args_tuple: Tuple,
 ) -> Tuple[str, int, int, int, int, int]:
     """
-    Worker function: reads one HDF5 file, flattens it, writes it directly, 
+    Worker function: reads one HDF5 file, flattens it, writes it atomically,
     and returns ONLY small summary metrics back to the parent process.
 
     Quality cut: tracks are dropped from the output entirely if, *after*
@@ -284,14 +284,55 @@ def _process_single_file(
     calo_hits_padded = np.stack(all_calo_padded, axis=0) if all_calo_padded else np.empty((0, max_crystals, n_calo_hit_feats), dtype=np.float32)
     calo_n_crystals = np.array(all_calo_n_crys, dtype=np.int32)
 
-    # WRITE DIRECTLY FROM THE WORKER PROCESS
-    _write_flat_h5(
-        out_path, features, ch_indices, offsets, mom_xyz, tandip,
-        calo_scalars, calo_matched_arr, calo_hits_padded, calo_n_crystals,
-        track_names, feature_names, calo_scalar_cols, max_crystals,
-    )
-
+    # Write beside the destination and publish atomically only after the file is
+    # closed and its required layout has been validated. This prevents an
+    # interrupted worker from leaving a partial .h5 that looks complete.
+    out_path = os.path.abspath(out_path)
+    tmp_path = f"{out_path}.tmp.{os.getpid()}"
     n_tracks = len(offsets) - 1
+    try:
+        _write_flat_h5(
+            tmp_path, features, ch_indices, offsets, mom_xyz, tandip,
+            calo_scalars, calo_matched_arr, calo_hits_padded, calo_n_crystals,
+            track_names, feature_names, calo_scalar_cols, max_crystals,
+        )
+        with h5py.File(tmp_path, "r") as check:
+            required = {
+                "features", "ch_indices", "offsets", "tandip",
+                "calo_matched", "track_names",
+            }
+            if has_momentum:
+                required.add("mom_xyz")
+            missing = sorted(required.difference(check.keys()))
+            if missing:
+                raise RuntimeError(
+                    f"Temporary flat output {tmp_path} is missing datasets: {missing}"
+                )
+            aligned = {
+                "tandip": check["tandip"].shape,
+                "calo_matched": check["calo_matched"].shape,
+                "track_names": check["track_names"].shape,
+            }
+            if has_momentum:
+                aligned["mom_xyz"] = check["mom_xyz"].shape[:1]
+            bad_shapes = {
+                name: shape for name, shape in aligned.items()
+                if shape != (n_tracks,)
+            }
+            if bad_shapes:
+                raise RuntimeError(
+                    f"Temporary flat output {tmp_path} has misaligned track "
+                    f"datasets: {bad_shapes}; expected first dimension {n_tracks}"
+                )
+            if not np.isfinite(check["tandip"][:]).all():
+                raise RuntimeError(
+                    f"Temporary flat output {tmp_path} has non-finite tandip values"
+                )
+        os.replace(tmp_path, out_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
     n_hits = len(ch_indices)
     n_matched = int(calo_matched_arr.sum())
     n_rejected_total = n_rejected_low_hits + n_rejected_low_stations + n_rejected_bad_mom
