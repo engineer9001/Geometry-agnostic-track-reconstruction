@@ -320,13 +320,13 @@ def main() -> None:
     calo_group = parser.add_mutually_exclusive_group()
     calo_group.add_argument(
         "--require-calo", dest="require_calo", action="store_true",
-        help="Evaluate only calo-matched tracks; does not use calo features.",
+        help="Evaluate only calo-matched tracks (default); does not use calo features.",
     )
     calo_group.add_argument(
         "--no-require-calo", dest="require_calo", action="store_false",
-        help="Evaluate all selected tracks, overriding a checkpoint's calo requirement.",
+        help="Evaluate all selected tracks without requiring a calorimeter match.",
     )
-    parser.set_defaults(require_calo=None)
+    parser.set_defaults(require_calo=True)
     parser.add_argument("--max-tracks", type=int, default=None)
     parser.add_argument("--tandip-min", type=float, default=None,
                         help="Inclusive signed lower bound (default: checkpoint setting).")
@@ -365,10 +365,7 @@ def main() -> None:
             "checkpoint was trained with use_calo=True. --require-calo only "
             "selects matched tracks and cannot supply calorimeter input tokens."
         )
-    require_calo = (
-        bool(training_config.get("require_calo", False))
-        if args.require_calo is None else args.require_calo
-    )
+    require_calo = args.require_calo
     model = TrackReconstructionModel(**TrackModelConfig(**config_dict).to_dict())
     state = {
         key.removeprefix("_orig_mod."): value

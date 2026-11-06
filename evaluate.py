@@ -476,11 +476,17 @@ def main():
     parser.add_argument("--forward-only", action="store_true", default=False,
                         help="Restrict evaluation to forward-going tracks (pz > 0). "
                              "Should match the --forward-only flag used during training.")
-    parser.add_argument("--require-calo", action="store_true", default=False,
-                        help="Keep only tracks associated with a calorimeter "
-                             "cluster, using the flat-file calo_matched field. "
-                             "This filters samples only and does not enable "
-                             "calorimeter input features.")
+    calo_group = parser.add_mutually_exclusive_group()
+    calo_group.add_argument(
+        "--require-calo", dest="require_calo", action="store_true",
+        help="Keep only tracks associated with a calorimeter cluster (default). "
+             "This filters samples only; it does not enable calorimeter input features.",
+    )
+    calo_group.add_argument(
+        "--no-require-calo", dest="require_calo", action="store_false",
+        help="Evaluate all tracks without requiring a calorimeter match.",
+    )
+    parser.set_defaults(require_calo=True)
     parser.add_argument("--tandip-min", type=float, default=None,
                         help="Inclusive signed lower bound (default: checkpoint setting).")
     parser.add_argument("--tandip-max", type=float, default=None,
